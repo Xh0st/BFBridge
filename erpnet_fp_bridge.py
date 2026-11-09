@@ -701,11 +701,20 @@ class ResilientWebSocketClient:
                 continue
 
             ws_url = self.get_ws_url()
+            if "token=" not in ws_url and token:
+                sep = "&" if "?" in ws_url else "?"
+                ws_target_url = f"{ws_url}{sep}token={token}"
+            else:
+                ws_target_url = ws_url
+
             logger.info(f"[WebSocket] Conectare la {ws_url}...")
             try:
-                extra_headers = {"X-Device-Token": token}
+                extra_headers = {
+                    "X-Device-Token": token,
+                    "User-Agent": "SincronaBridge/2.0",
+                }
                 async with websockets.connect(
-                    ws_url,
+                    ws_target_url,
                     additional_headers=extra_headers,
                     ping_interval=20,
                     ping_timeout=15,

@@ -31,7 +31,6 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=installer_output
 
 [Languages]
-Name: "ro"; MessagesFile: "compiler:Languages\Romanian.isl"
 Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Dirs]

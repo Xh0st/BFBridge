@@ -21,6 +21,7 @@ config.json
 # Temporary files
 *.tmp
 *.bak
+python_libs/
 github_release.py
 
 # Virtual Environment
