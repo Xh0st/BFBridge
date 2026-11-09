@@ -113,9 +113,9 @@ def clear_errors():
 # ==================== CONFIGURATION MANAGER ====================
 
 DEFAULT_CONFIG = {
-    "API_URL": "https://sincrona.ro",
+    "API_URL": os.environ.get("SINCRONA_API_URL", "https://api.sincrona.ro"),
     "WS_URL": "",
-    "DEVICE_TOKEN": "",
+    "DEVICE_TOKEN": os.environ.get("FP_DEVICE_TOKEN", ""),
     "FISCAL_DRIVER": "erpnet",  # 'erpnet', 'datecs', 'tremol'
     "ERPNET_URL": "http://127.0.0.1:8001",
     "DATECS_IN_DIR": r"C:\Datecs\In",
@@ -685,9 +685,9 @@ class ResilientWebSocketClient:
         cfg = get_config()
         if cfg.get("WS_URL"):
             return cfg["WS_URL"]
-        api = cfg.get("API_URL", "https://sincrona.ro").rstrip("/")
+        api = cfg.get("API_URL", "https://api.sincrona.ro").rstrip("/")
         ws_scheme = "wss" if api.startswith("https") else "ws"
-        host = urlparse(api).netloc or "sincrona.ro"
+        host = urlparse(api).netloc or "api.sincrona.ro"
         return f"{ws_scheme}://{host}/ws/device/fiscal-printer"
 
     async def _run_loop(self):
@@ -970,11 +970,11 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       <h2 style="margin-top:24px;">☁️ Conexiune Cloud (Sincrona)</h2>
       <div class="field">
         <label for="apiUrl">API URL</label>
-        <input id="apiUrl" placeholder="https://sincrona.ro">
+        <input id="apiUrl" placeholder="https://api.sincrona.ro">
       </div>
       <div class="field">
         <label for="wsUrl">WebSocket URL (Opțional / Auto-detectat)</label>
-        <input id="wsUrl" placeholder="wss://sincrona.ro/ws/device/fiscal-printer">
+        <input id="wsUrl" placeholder="wss://api.sincrona.ro/ws/device/fiscal-printer">
       </div>
       <div class="field">
         <label for="deviceToken">Device Token</label>
