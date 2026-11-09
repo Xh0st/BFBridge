@@ -391,6 +391,13 @@ class DatecsDriver(BaseFiscalDriver):
         # Comanda 49: Înregistrare articole
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
+            # Linii de text liber/comentariu (ex: referință comandă de lucru)
+            if it.get("type") == "comment" or (it.get("unitPrice") is None and it.get("price") is None):
+                txt = (it.get("text") or it.get("name") or it.get("description") or "").strip()[:36].replace("\t", " ")
+                if txt:
+                    lines.append(f"54,{txt}\t")
+                continue
+
             name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:36].replace("\t", " ")
             vat = it.get("taxGroup") or it.get("vat_group") or it.get("vatGroup") or 1
             raw_price = it.get("unitPrice") if it.get("unitPrice") is not None else it.get("price", 0)
@@ -455,6 +462,8 @@ class DatecsDriver(BaseFiscalDriver):
 
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
+            if it.get("type") == "comment" or (it.get("unitPrice") is None and it.get("price") is None):
+                continue
             name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:32].replace(";", " ")
             raw_price = it.get("unitPrice") if it.get("unitPrice") is not None else it.get("price", 0)
             price = f"{float(raw_price):.2f}"
@@ -676,8 +685,16 @@ class TremolDriver(BaseFiscalDriver):
 
         # Articole conform DocumentatieFormatServerTremol.txt:
         # V|<denumire produs>[max 32]`sau~<um max 3>|<tva 0-5>|<pret>|<cantitate>|<-discount>|<tip discount>|<departament>
+        # T|<text liber>[max 35] pentru linii de comentarii / comanda de lucru
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
+            # Comentariu sau text informativ (ex. "Comanda lucru: CL-...")
+            if it.get("type") == "comment" or (it.get("unitPrice") is None and it.get("price") is None):
+                txt = (it.get("text") or it.get("name") or it.get("description") or "").strip()[:35].replace("|", " ")
+                if txt:
+                    lines.append(f"T|{txt}")
+                continue
+
             name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:32].replace("|", " ")
             raw_unit = (it.get("unit") or "buc").strip().replace("~", "").replace("`", "").replace("|", "")
             unit = (raw_unit if raw_unit else "buc")[:3]
