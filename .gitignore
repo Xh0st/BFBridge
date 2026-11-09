@@ -1,0 +1,28 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution & Packaging
+dist/
+build/
+build_nuitka/
+*.build/
+*.dist/
+*.onefile-build/
+installer_output/
+
+# Local Runtime Configuration & Logs (never commit tokens)
+logs/
+*.log
+*.jsonl
+config.json
+
+# Temporary files
+*.tmp
+*.bak
+
+# Virtual Environment
+venv/
+.venv/
+env/
