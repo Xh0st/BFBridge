@@ -401,8 +401,22 @@ class DatecsDriver(BaseFiscalDriver):
             lines.append(f"49,{name}\t{vat}\t{price}\t{qty}\t\t\t{dep}\t{um}\t")
 
         # Comanda 53: Înregistrare plăți
-        # Mapare tip plată Datecs: 0=Numerar, 1=Card, 2=Tichet, 3=Credit, etc.
-        payment_map = {"cash": 0, "card": 1, "pos": 1, "ticket": 2, "voucher": 3, "bank": 4}
+        # Mapare tip plată Datecs DUDE: 0=Numerar, 1=Card, 2=Tichete Masă, 3=Tichete Cadou, 4=Credit, etc.
+        payment_map = {
+            "cash": 0,
+            "numerar": 0,
+            "card": 1,
+            "pos": 1,
+            "ticket": 2,
+            "tichet": 2,
+            "tichete": 2,
+            "voucher": 3,
+            "credit": 4,
+            "bank": 8,
+            "virament": 8,
+            "op": 8,
+            "other": 8,
+        }
         payments = receipt.get("payments") or []
         if not payments:
             payments = [{"paymentType": "cash", "amount": 0}]
@@ -410,8 +424,13 @@ class DatecsDriver(BaseFiscalDriver):
         for p in payments:
             ptype_raw = str(p.get("paymentType", "cash")).lower()
             ptype = payment_map.get(ptype_raw, 0)
-            amount = f"{float(p.get('amount', 0)):.2f}"
-            lines.append(f"53,{ptype}\t{amount}\t")
+            amt_num = float(p.get("amount", 0))
+            if amt_num > 0:
+                amount = f"{amt_num:.2f}"
+                lines.append(f"53,{ptype}\t{amount}\t")
+            else:
+                # În DUDE dacă lăsăm suma goală '53,0\t\t', închide restul cu numerar
+                lines.append(f"53,{ptype}\t\t")
 
         # Comanda 56: Închidere bon fiscal
         lines.append("56")
@@ -469,7 +488,7 @@ class DatecsDriver(BaseFiscalDriver):
         inp_file = os.path.join(self.in_dir, f"{base_name}.inp")
 
         logger.info(f"[Datecs] Scriere fișier {inp_file} ({len(cmd_lines)} linii, cp1250)")
-        with open(tmp_file, "w", encoding="cp1250", errors="replace") as f:
+        with open(tmp_file, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(content)
         # Redenumire atomică pentru a preveni citirea parțială de către driver
         if os.path.exists(inp_file):
@@ -495,17 +514,20 @@ class DatecsDriver(BaseFiscalDriver):
         to_date = body.get("toDate", "")[:10]
 
         if "period" in low_type and from_date and to_date:
-            # Format Datecs raport memorie fiscală pe perioadă de date: DDMMYY
             f_p = from_date.split("-")
             t_p = to_date.split("-")
             if len(f_p) == 3 and len(t_p) == 3:
-                d_from = f"{f_p[2]}{f_p[1]}{f_p[0][2:]}"
-                d_to = f"{t_p[2]}{t_p[1]}{t_p[0][2:]}"
                 det = "1" if body.get("type") == "detailed" else "0"
                 if self.format_mode == "fprinter":
+                    # FPrinter: format DDMMYY
+                    d_from = f"{f_p[2]}{f_p[1]}{f_p[0][2:]}"
+                    d_to = f"{t_p[2]}{t_p[1]}{t_p[0][2:]}"
                     cmd = f"M,1,______,_,__;{d_from};{d_to};{det};\r\n"
                 else:
-                    cmd = f"94,{d_from},{d_to},{det}\t\r\n"
+                    # DUDE conform avizare (COM 94): 94,{det}\tDD-MM-YY\tDD-MM-YY\t
+                    d_from = f"{f_p[2]}-{f_p[1]}-{f_p[0][2:]}"
+                    d_to = f"{t_p[2]}-{t_p[1]}-{t_p[0][2:]}"
+                    cmd = f"94,{det}\t{d_from}\t{d_to}\t\r\n"
             else:
                 cmd = "Z,1,______,_,__;\r\n" if self.format_mode == "fprinter" else "69,Z\t\r\n"
         else:
@@ -518,7 +540,7 @@ class DatecsDriver(BaseFiscalDriver):
         tmp_file = os.path.join(self.in_dir, f"{base_name}.tmp")
         inp_file = os.path.join(self.in_dir, f"{base_name}.inp")
 
-        with open(tmp_file, "w", encoding="cp1250", errors="replace") as f:
+        with open(tmp_file, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(cmd)
         os.rename(tmp_file, inp_file)
 
@@ -552,7 +574,15 @@ class TremolDriver(BaseFiscalDriver):
         }
 
     def _wait_for_response(self, job_name: str) -> str:
-        """Monitorizează raspuns.txt din folderul out_dir sau din rădăcina ServerTremol."""
+        """
+        Monitorizează procesarea fișierului de către ServerTremol.
+        ServerTremol mută fișierele executate în Bonuri/done, Bonuri/error sau Bonuri/bad
+        și scrie răspunsul în raspuns.txt / status.log.
+        """
+        done_file = os.path.join(self.in_dir, "done", f"{job_name}.txt")
+        err_file = os.path.join(self.in_dir, "error", f"{job_name}.txt")
+        bad_file = os.path.join(self.in_dir, "bad", f"{job_name}.txt")
+
         candidates = [
             os.path.join(self.out_dir, "raspuns.txt"),
             os.path.join(self.out_dir, f"{job_name}.ans"),
@@ -565,47 +595,92 @@ class TremolDriver(BaseFiscalDriver):
         deadline = time.time() + self.timeout_s
 
         while time.time() < deadline:
+            # 1. Verificăm dacă ServerTremol a marcat ca eroare sau sintaxă greșită
+            if os.path.exists(err_file) or os.path.exists(bad_file):
+                resp_info = ""
+                rasp_path = os.path.join(self.out_dir, "raspuns.txt")
+                if os.path.exists(rasp_path):
+                    try:
+                        with open(rasp_path, "r", encoding="cp1250", errors="replace") as f:
+                            resp_info = f.read().strip()
+                    except Exception:
+                        pass
+                raise FiscalException("TREMOL_ERROR", f"Tremol a respins fișierul ({'bad' if os.path.exists(bad_file) else 'error'}). Răspuns: {resp_info}")
+
+            # 2. Verificăm dacă fișierul a fost finalizat cu succes în done/
+            if os.path.exists(done_file):
+                resp_info = "OK (Executat cu succes în Bonuri/done)"
+                rasp_path = os.path.join(self.out_dir, "raspuns.txt")
+                if os.path.exists(rasp_path):
+                    try:
+                        with open(rasp_path, "r", encoding="cp1250", errors="replace") as f:
+                            c = f.read().strip()
+                            if c:
+                                resp_info = c
+                    except Exception:
+                        pass
+                return resp_info
+
+            # 3. Verificăm dacă raspuns.txt a fost modificat
             for p in candidates:
                 if os.path.exists(p):
                     mtime = os.path.getmtime(p)
                     if mtime > init_mtimes.get(p, 0):
                         time.sleep(0.3)
                         with open(p, "r", encoding="cp1250", errors="replace") as f:
-                            return f.read().strip()
+                            ans = f.read().strip()
+                            if "ERR" in ans.upper() or "ERROR" in ans.upper():
+                                raise FiscalException("TREMOL_REJECTED", ans)
+                            return ans
             time.sleep(0.4)
 
-        # Dacă fișierul din IN a fost consumat/șters de Tremol, considerăm succes
+        # 4. Dacă fișierul a dispărut din IN (a fost preluat), considerăm succes dacă nu e în error
         in_file = os.path.join(self.in_dir, f"{job_name}.txt")
         if not os.path.exists(in_file):
+            if os.path.exists(err_file) or os.path.exists(bad_file):
+                raise FiscalException("TREMOL_ERROR", "Fișierul a fost mutat în error/bad de către ServerTremol")
             return "OK (Fișier prelucrat de Tremol)"
 
-        raise FiscalException("TREMOL_TIMEOUT", f"Tremol nu a procesat bonul în {self.timeout_s}s.")
+        raise FiscalException("TREMOL_TIMEOUT", f"Tremol nu a procesat bonul în {self.timeout_s}s. Verificați că ServerTremol.exe rulează și casa este conectată în REG.OPER.")
 
     def print_receipt(self, job_payload: dict, task_id: str) -> dict:
+        """
+        Construiește bon fiscal conform specificației oficiale ServerTremol:
+        Linia 1: C|<cui>|<denumire>|<adresa> (obligatoriu prima linie dacă există CUI)
+        Linii V: V|<denumire produs>~<um>|<tva 0-5>|<pret>|<cantitate>|<-discount>|<tip disc>|<dep>
+        Linia U: U|0|0 (subtotal)
+        Linii P: P|<tip plata>|<suma> (0=Numerar, 1=Card, 3=Tichete, 5=Voucher, 8=Alte)
+        """
         receipt = job_payload.get("receipt") or job_payload.get("body") or {}
         job_name = f"bon.{int(time.time())}_{task_id[-6:]}"
         lines = []
 
-        # CUI client dacă există (C|<cui>|<denumire>|<adresa>)
+        # CUI client dacă există conform sintaxă Tremol:
+        # C|<cui - max 15>|<denumire - max 30>|<adresa - max 30>
         recipient = receipt.get("recipient") or {}
         customer = receipt.get("customer") or {}
         cui = str(
             job_payload.get("buyer_tax_id")
+            or receipt.get("buyer_tax_id")
             or recipient.get("identifier")
             or recipient.get("vatNumber")
             or customer.get("tax_number")
             or ""
         ).strip().upper()
-        if cui:
-            name = (recipient.get("name") or customer.get("name") or "Client")[:30].replace("|", " ")
-            addr = (recipient.get("address") or customer.get("address") or "-")[:30].replace("|", " ")
-            lines.append(f"C|{cui}|{name}|{addr}")
 
-        # Articole: V|<denumire>~<um>|<tva 1-8>|<pret>|<cantitate>|<discount>|<tip_disc>|<dep>
+        if cui:
+            name = (recipient.get("name") or customer.get("name") or job_payload.get("buyer_name") or "Client").strip()[:30].replace("|", " ")
+            addr = (recipient.get("address") or customer.get("address") or job_payload.get("buyer_address") or "-").strip()[:30].replace("|", " ")
+            cui_clean = cui[:15].replace("|", "")
+            lines.append(f"C|{cui_clean}|{name}|{addr}")
+
+        # Articole conform DocumentatieFormatServerTremol.txt:
+        # V|<denumire produs>[max 32]`sau~<um max 3>|<tva 0-5>|<pret>|<cantitate>|<-discount>|<tip discount>|<departament>
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
             name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:32].replace("|", " ")
-            unit = (it.get("unit") or "buc").strip()[:6].replace("~", "").replace("|", "")
+            raw_unit = (it.get("unit") or "buc").strip().replace("~", "").replace("`", "").replace("|", "")
+            unit = (raw_unit if raw_unit else "buc")[:3]
             vat = it.get("taxGroup") or it.get("vat_group") or it.get("vatGroup") or 1
             raw_price = it.get("unitPrice") if it.get("unitPrice") is not None else it.get("price", 0)
             price = f"{float(raw_price):.2f}"
@@ -615,39 +690,51 @@ class TremolDriver(BaseFiscalDriver):
             dep = it.get("department", 1)
             lines.append(f"V|{name}~{unit}|{vat}|{price}|{qty}|{disc}|{disc_type}|{dep}")
 
-        # Subtotal
+        # Subtotal fără discount conform doc: U|0|0
         lines.append("U|0|0")
 
-        # Plăți: P|<tip>|<suma>
-        # Tremol: 0=Numerar, 1=Card, 3=Tichete, 5=Voucher, 8=Alte
-        pay_map = {"cash": 0, "card": 1, "pos": 1, "ticket": 3, "voucher": 5, "bank": 8}
+        # Plăți conform TipPlatiInitiale.txt:
+        # 0: Numerar, 1: Card, 3: Tichete, 4: Bonuri, 5: Voucher, 6: Credit, 8: Alte
+        pay_map = {
+            "cash": 0, "numerar": 0,
+            "card": 1, "pos": 1,
+            "ticket": 3, "tichet": 3, "tichete": 3,
+            "bon": 4, "bonuri": 4,
+            "voucher": 5,
+            "credit": 6,
+            "bank": 8, "virament": 8, "op": 8, "other": 8, "alta": 8, "alte": 8
+        }
         payments = receipt.get("payments") or [{"paymentType": "cash", "amount": 0}]
         for p in payments:
             ptype = pay_map.get(str(p.get("paymentType", "cash")).lower(), 0)
-            amt = f"{float(p.get('amount', 0)):.2f}"
-            lines.append(f"P|{ptype}|{amt}")
+            amt_num = float(p.get("amount", 0))
+            if amt_num > 0:
+                amt = f"{amt_num:.2f}"
+                lines.append(f"P|{ptype}|{amt}")
+            else:
+                # P|0|0 închide bonul cu plata integrală în numerar (exact cash)
+                lines.append(f"P|{ptype}|0")
 
         target_file = os.path.join(self.in_dir, f"{job_name}.txt")
         tmp_file = os.path.join(self.in_dir, f"{job_name}.tmp")
         content = "\r\n".join(lines) + "\r\n"
 
-        logger.info(f"[Tremol] Scriere bon {target_file}")
-        with open(tmp_file, "w", encoding="cp1250", errors="replace") as f:
+        logger.info(f"[Tremol] Scriere bon {target_file} ({len(lines)} linii)")
+        with open(tmp_file, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(content)
         os.rename(tmp_file, target_file)
 
         res = self._wait_for_response(job_name)
-        if "ERROR" in res.upper() or "ERR" in res.upper():
-            raise FiscalException("TREMOL_REJECTED", res)
-
         return {"ok": True, "result": res}
 
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
+        """
+        Execută rapoarte fiscale Tremol:
+        - Raport Z zilnic (bon.z.raport.txt cu comanda Z)
+        - Raport X informativ (bon.x.raport.txt cu comanda X)
+        - Raport periodic memorie fiscală pe date (F|DDMMYY|DDMMYY|0=sumar/1=detaliat)
+        """
         low_type = report_type.lower().replace("_", "")
-        file_name = f"bon.rep_{low_type}_{int(time.time())}.txt"
-        target_path = os.path.join(self.in_dir, file_name)
-        tmp_path = os.path.join(self.in_dir, f"{file_name}.tmp")
-
         body = job_payload.get("body", {})
         from_date = body.get("fromDate", "")[:10]
         to_date = body.get("toDate", "")[:10]
@@ -656,16 +743,24 @@ class TremolDriver(BaseFiscalDriver):
             f_p = from_date.split("-")
             t_p = to_date.split("-")
             if len(f_p) == 3 and len(t_p) == 3:
+                # Format oficial Tremol: F|DDMMYY|DDMMYY|0/1
                 d_from = f"{f_p[2]}{f_p[1]}{f_p[0][2:]}"
                 d_to = f"{t_p[2]}{t_p[1]}{t_p[0][2:]}"
-                cmd = f"M|d|{d_from}|{d_to}\r\n"
+                det = "1" if body.get("type") == "detailed" else "0"
+                cmd = f"F|{d_from}|{d_to}|{det}\r\n"
+                file_name = f"bon.RaportPeriodicSume_{int(time.time())}.txt"
             else:
                 cmd = "Z\r\n"
+                file_name = f"bon.z.raport_{int(time.time())}.txt"
         else:
             is_z = "z" in low_type
             cmd = "Z\r\n" if is_z else "X\r\n"
+            file_name = f"bon.z.raport_{int(time.time())}.txt" if is_z else f"bon.x.raport_{int(time.time())}.txt"
 
-        with open(tmp_path, "w", encoding="cp1250", errors="replace") as f:
+        target_path = os.path.join(self.in_dir, file_name)
+        tmp_path = os.path.join(self.in_dir, f"{file_name}.tmp")
+
+        with open(tmp_path, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(cmd)
         if os.path.exists(target_path):
             os.remove(target_path)
