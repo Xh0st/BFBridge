@@ -367,15 +367,24 @@ class DatecsDriver(BaseFiscalDriver):
         except Exception as e:
             raise FiscalException("DATECS_READ_ERROR", f"Nu am putut citi răspunsul {found_file}: {e}")
 
-    def _build_dude_lines(self, receipt: dict) -> list:
+    def _build_dude_lines(self, receipt: dict, job_payload: dict = None) -> list:
         """Construiește comenzi în format Datecs DUDE nativ (48, 49, 53, 56)."""
         lines = []
+        payload = job_payload or {}
+        recipient = receipt.get("recipient") or {}
         customer = receipt.get("customer") or {}
-        tax_num = customer.get("tax_number", "").strip()
+        tax_num = str(
+            payload.get("buyer_tax_id")
+            or recipient.get("identifier")
+            or recipient.get("vatNumber")
+            or customer.get("tax_number")
+            or ""
+        ).strip().upper()
+        tax_digits = tax_num[2:] if tax_num.startswith("RO") else tax_num
 
-        # Comanda 48: Deschidere bon fiscal
-        if tax_num:
-            lines.append(f"48,1\t0001\t1\tI\t{tax_num}\t")
+        # Comanda 48: Deschidere bon fiscal (I + CUI dacă este persoană juridică)
+        if tax_digits:
+            lines.append(f"48,1\t0001\t1\tI\t{tax_digits}\t")
         else:
             lines.append("48,1\t0001\t1\t\t\t")
 
@@ -408,13 +417,22 @@ class DatecsDriver(BaseFiscalDriver):
         lines.append("56")
         return lines
 
-    def _build_fprinter_lines(self, receipt: dict) -> list:
+    def _build_fprinter_lines(self, receipt: dict, job_payload: dict = None) -> list:
         """Construiește comenzi în format Datecs FPrinter clasic (S,1,... P,1,... T,1,...)."""
         lines = []
+        payload = job_payload or {}
+        recipient = receipt.get("recipient") or {}
         customer = receipt.get("customer") or {}
-        tax_num = customer.get("tax_number", "").strip()
-        if tax_num:
-            lines.append(f"CF,1,______,_,__;{tax_num};")
+        tax_num = str(
+            payload.get("buyer_tax_id")
+            or recipient.get("identifier")
+            or recipient.get("vatNumber")
+            or customer.get("tax_number")
+            or ""
+        ).strip().upper()
+        tax_digits = tax_num[2:] if tax_num.startswith("RO") else tax_num
+        if tax_digits:
+            lines.append(f"CF,1,______,_,__;{tax_digits};")
 
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
@@ -442,9 +460,9 @@ class DatecsDriver(BaseFiscalDriver):
         base_name = f"bon_{int(time.time())}_{task_id[-8:]}"
 
         if self.format_mode == "fprinter":
-            cmd_lines = self._build_fprinter_lines(receipt)
+            cmd_lines = self._build_fprinter_lines(receipt, job_payload)
         else:
-            cmd_lines = self._build_dude_lines(receipt)
+            cmd_lines = self._build_dude_lines(receipt, job_payload)
 
         content = "\r\n".join(cmd_lines) + "\r\n"
         tmp_file = os.path.join(self.in_dir, f"{base_name}.tmp")
@@ -569,11 +587,18 @@ class TremolDriver(BaseFiscalDriver):
         lines = []
 
         # CUI client dacă există (C|<cui>|<denumire>|<adresa>)
+        recipient = receipt.get("recipient") or {}
         customer = receipt.get("customer") or {}
-        cui = customer.get("tax_number", "").strip()
+        cui = str(
+            job_payload.get("buyer_tax_id")
+            or recipient.get("identifier")
+            or recipient.get("vatNumber")
+            or customer.get("tax_number")
+            or ""
+        ).strip().upper()
         if cui:
-            name = (customer.get("name") or "Client")[:30].replace("|", " ")
-            addr = (customer.get("address") or "-")[:30].replace("|", " ")
+            name = (recipient.get("name") or customer.get("name") or "Client")[:30].replace("|", " ")
+            addr = (recipient.get("address") or customer.get("address") or "-")[:30].replace("|", " ")
             lines.append(f"C|{cui}|{name}|{addr}")
 
         # Articole: V|<denumire>~<um>|<tva 1-8>|<pret>|<cantitate>|<discount>|<tip_disc>|<dep>
