@@ -462,7 +462,11 @@ class DatecsDriver(BaseFiscalDriver):
 
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
+            # Comentariu / text informativ (ex. deviz de lucru)
             if it.get("type") == "comment" or (it.get("unitPrice") is None and it.get("price") is None):
+                txt = (it.get("text") or it.get("name") or it.get("description") or "").strip()[:32].replace(";", " ")
+                if txt:
+                    lines.append(f"I,1,______,_,__;{txt};")
                 continue
             name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:32].replace(";", " ")
             raw_price = it.get("unitPrice") if it.get("unitPrice") is not None else it.get("price", 0)
