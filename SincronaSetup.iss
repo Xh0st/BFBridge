@@ -4,7 +4,7 @@
 ; ========================================================
 
 #define MyAppName "Sincrona Universal Fiscal Bridge"
-#define MyAppVersion "1.0.1"
+#define MyAppVersion "1.0.2"
 #define MyAppPublisher "Sincrona Auto"
 #define MyAppURL "https://sincrona.ro"
 #define MyAppExeName "SincronaBridge.exe"

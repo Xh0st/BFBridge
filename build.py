@@ -15,9 +15,7 @@ def build():
     print("=" * 60)
 
     dist_dir = os.path.join(BASE_DIR, "dist")
-    if os.path.exists(dist_dir):
-        print("[1/3] Curatare folder dist...")
-        shutil.rmtree(dist_dir, ignore_errors=True)
+    print("[1/3] Pastrare cache si pregatire folder dist...")
 
     cmd = [
         sys.executable,
