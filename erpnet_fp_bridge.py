@@ -467,13 +467,33 @@ class DatecsDriver(BaseFiscalDriver):
         return {"ok": True, "raw_response": res_text, "file": base_name}
 
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
-        base_name = f"rep_{report_type}_{int(time.time())}"
-        rep_char = "Z" if "z" in report_type.lower() else "X"
+        low_type = report_type.lower().replace("_", "")
+        base_name = f"rep_{low_type}_{int(time.time())}"
 
-        if self.format_mode == "fprinter":
-            cmd = f"{rep_char},1,______,_,__;\r\n"
+        body = job_payload.get("body", {})
+        from_date = body.get("fromDate", "")[:10]
+        to_date = body.get("toDate", "")[:10]
+
+        if "period" in low_type and from_date and to_date:
+            # Format Datecs raport memorie fiscală pe perioadă de date: DDMMYY
+            f_p = from_date.split("-")
+            t_p = to_date.split("-")
+            if len(f_p) == 3 and len(t_p) == 3:
+                d_from = f"{f_p[2]}{f_p[1]}{f_p[0][2:]}"
+                d_to = f"{t_p[2]}{t_p[1]}{t_p[0][2:]}"
+                det = "1" if body.get("type") == "detailed" else "0"
+                if self.format_mode == "fprinter":
+                    cmd = f"M,1,______,_,__;{d_from};{d_to};{det};\r\n"
+                else:
+                    cmd = f"94,{d_from},{d_to},{det}\t\r\n"
+            else:
+                cmd = "Z,1,______,_,__;\r\n" if self.format_mode == "fprinter" else "69,Z\t\r\n"
         else:
-            cmd = f"69,{rep_char}\t\r\n"
+            rep_char = "Z" if "z" in low_type else "X"
+            if self.format_mode == "fprinter":
+                cmd = f"{rep_char},1,______,_,__;\r\n"
+            else:
+                cmd = f"69,{rep_char}\t\r\n"
 
         tmp_file = os.path.join(self.in_dir, f"{base_name}.tmp")
         inp_file = os.path.join(self.in_dir, f"{base_name}.inp")
@@ -594,12 +614,28 @@ class TremolDriver(BaseFiscalDriver):
         return {"ok": True, "result": res}
 
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
-        is_z = "z" in report_type.lower()
-        file_name = "bon.z.raport.txt" if is_z else "bon.x.raport.txt"
+        low_type = report_type.lower().replace("_", "")
+        file_name = f"bon.rep_{low_type}_{int(time.time())}.txt"
         target_path = os.path.join(self.in_dir, file_name)
         tmp_path = os.path.join(self.in_dir, f"{file_name}.tmp")
 
-        cmd = "Z\r\n" if is_z else "X\r\n"
+        body = job_payload.get("body", {})
+        from_date = body.get("fromDate", "")[:10]
+        to_date = body.get("toDate", "")[:10]
+
+        if "period" in low_type and from_date and to_date:
+            f_p = from_date.split("-")
+            t_p = to_date.split("-")
+            if len(f_p) == 3 and len(t_p) == 3:
+                d_from = f"{f_p[2]}{f_p[1]}{f_p[0][2:]}"
+                d_to = f"{t_p[2]}{t_p[1]}{t_p[0][2:]}"
+                cmd = f"M|d|{d_from}|{d_to}\r\n"
+            else:
+                cmd = "Z\r\n"
+        else:
+            is_z = "z" in low_type
+            cmd = "Z\r\n" if is_z else "X\r\n"
+
         with open(tmp_path, "w", encoding="cp1250", errors="replace") as f:
             f.write(cmd)
         if os.path.exists(target_path):
@@ -643,9 +679,11 @@ class FiscalRouter:
         kind = job.get("kind", "receipt").lower()
         payload = job.get("payload", {})
 
+        norm_kind = kind.replace("_", "")
         logger.info(f"[Router] Procesare job {job.get('id')} cu driver {driver.__class__.__name__} (kind={kind})")
-        if kind in ("xreport", "zreport", "periodreport"):
-            return driver.print_report(kind, payload, task_id)
+        if norm_kind in ("xreport", "zreport", "periodreport") or "report" in norm_kind or payload.get("endpoint") in ("xreport", "zreport", "periodreport"):
+            rep_type = payload.get("endpoint") or norm_kind
+            return driver.print_report(rep_type, payload, task_id)
         else:
             return driver.print_receipt(payload, task_id)
 
