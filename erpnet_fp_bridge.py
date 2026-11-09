@@ -774,10 +774,15 @@ class ResilientWebSocketClient:
                                 complete_job_http(job_id, "failed", fail_payload)
 
             except Exception as e:
-                update_state(connected_ws=False, last_error=f"WS: {e}")
-                logger.warning(f"[WebSocket] Conexiune întreruptă: {e}. Reconectare în {backoff}s...")
+                update_state(connected_ws=False)
+                err_str = str(e)
+                if "403" in err_str or "404" in err_str:
+                    logger.info("[WebSocket] Endpoint WebSocket indisponibil pe server; comutare automată pe REST Polling.")
+                    backoff = 60
+                else:
+                    logger.warning(f"[WebSocket] Conexiune întreruptă: {e}. Reconectare în {backoff}s...")
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
+                backoff = min(backoff * 2, 120)
 
     def start(self):
         if not HAS_WEBSOCKETS:
@@ -1074,10 +1079,13 @@ async function updateStatus() {
     const txt = document.getElementById('wsStatusText');
     if (s.connected_ws) {
       ind.className = 'status-pill online';
-      txt.textContent = 'WebSocket: Conectat';
+      txt.textContent = 'Cloud: WebSocket Conectat';
+    } else if (s.connected_cloud) {
+      ind.className = 'status-pill online';
+      txt.textContent = 'Cloud: REST Polling Activ';
     } else {
       ind.className = 'status-pill offline';
-      txt.textContent = 'WebSocket: Deconectat';
+      txt.textContent = 'Cloud: Deconectat';
     }
 
     document.getElementById('stDriver').textContent = (s.active_driver || 'erpnet').toUpperCase();
