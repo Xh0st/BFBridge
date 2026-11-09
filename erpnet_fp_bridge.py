@@ -382,12 +382,13 @@ class DatecsDriver(BaseFiscalDriver):
         # Comanda 49: Înregistrare articole
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
-            name = it.get("name", "Articol")[:36].replace("\t", " ")
-            vat = it.get("vat_group", it.get("vatGroup", 1))
-            price = f"{float(it.get('price', 0)):.2f}"
+            name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:36].replace("\t", " ")
+            vat = it.get("taxGroup") or it.get("vat_group") or it.get("vatGroup") or 1
+            raw_price = it.get("unitPrice") if it.get("unitPrice") is not None else it.get("price", 0)
+            price = f"{float(raw_price):.2f}"
             qty = f"{float(it.get('quantity', 1)):.3f}"
             dep = it.get("department", 1)
-            um = it.get("unit", "BUC.")[:4]
+            um = (it.get("unit") or "BUC.")[:4]
             lines.append(f"49,{name}\t{vat}\t{price}\t{qty}\t\t\t{dep}\t{um}\t")
 
         # Comanda 53: Înregistrare plăți
@@ -417,12 +418,13 @@ class DatecsDriver(BaseFiscalDriver):
 
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
-            name = it.get("name", "Articol")[:32].replace(";", " ")
-            price = f"{float(it.get('price', 0)):.2f}"
+            name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:32].replace(";", " ")
+            raw_price = it.get("unitPrice") if it.get("unitPrice") is not None else it.get("price", 0)
+            price = f"{float(raw_price):.2f}"
             qty = f"{float(it.get('quantity', 1)):.3f}"
             dep = it.get("department", 1)
-            vat = it.get("vat_group", 1)
-            um = it.get("unit", "buc")[:3]
+            vat = it.get("taxGroup") or it.get("vat_group") or it.get("vatGroup") or 1
+            um = (it.get("unit") or "buc")[:3]
             lines.append(f"S,1,______,_,__;{name};{price};{qty};{dep};{vat};{um};")
 
         payments = receipt.get("payments") or [{"paymentType": "cash", "amount": 0}]
@@ -574,17 +576,19 @@ class TremolDriver(BaseFiscalDriver):
             addr = (customer.get("address") or "-")[:30].replace("|", " ")
             lines.append(f"C|{cui}|{name}|{addr}")
 
-        # Articole: V|<denumire>~buc|<tva 0-5>|<pret>|<cantitate>|<discount>|<tip_disc>|<dep>
+        # Articole: V|<denumire>~<um>|<tva 1-8>|<pret>|<cantitate>|<discount>|<tip_disc>|<dep>
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
-            name = it.get("name", "Produs")[:32].replace("|", " ")
-            vat = it.get("vat_group", 1)
-            price = f"{float(it.get('price', 0)):.2f}"
+            name = (it.get("text") or it.get("name") or it.get("description") or "Articol").strip()[:32].replace("|", " ")
+            unit = (it.get("unit") or "buc").strip()[:6].replace("~", "").replace("|", "")
+            vat = it.get("taxGroup") or it.get("vat_group") or it.get("vatGroup") or 1
+            raw_price = it.get("unitPrice") if it.get("unitPrice") is not None else it.get("price", 0)
+            price = f"{float(raw_price):.2f}"
             qty = f"{float(it.get('quantity', 1)):.3f}"
             disc = "0"
             disc_type = "0"
             dep = it.get("department", 1)
-            lines.append(f"V|{name}~buc|{vat}|{price}|{qty}|{disc}|{disc_type}|{dep}")
+            lines.append(f"V|{name}~{unit}|{vat}|{price}|{qty}|{disc}|{disc_type}|{dep}")
 
         # Subtotal
         lines.append("U|0|0")
