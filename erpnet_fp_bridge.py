@@ -300,6 +300,47 @@ class ErpNetFPDriver(BaseFiscalDriver):
         return self.print_receipt(job_copy, task_id)
 
 
+def sanitize_comment_text(txt: str, max_len: int = 35) -> str:
+    """Asigură că liniile de deviz/comandă sunt formatate uniform ca 'Deviz: DV-...'."""
+    txt = (txt or "").strip()
+    low = txt.lower()
+    if low.startswith("comanda lucru:") or low.startswith("comanda de lucru:"):
+        raw_num = txt.split(":", 1)[1].strip()
+        dv_num = f"DV-{raw_num[3:]}" if raw_num.upper().startswith("CL-") else (f"DV-{raw_num}" if not raw_num.upper().startswith("DV-") else raw_num)
+        txt = f"Deviz: {dv_num}"
+    elif low.startswith("comanda lucru") or low.startswith("comanda de lucru"):
+        txt = re.sub(r"^comanda\s+(?:de\s+)?lucru[:\s]*", "Deviz: ", txt, flags=re.I)
+        txt = re.sub(r"Deviz:\s*CL-", "Deviz: DV-", txt, flags=re.I)
+    return txt[:max_len]
+
+
+def resolve_buyer_tax_num(payload: dict, receipt: dict) -> str:
+    """Extrage CUI-ul cumpărătorului și păstrează/adaugă prefixul RO dacă este plătitor de TVA."""
+    recipient = receipt.get("recipient") or {}
+    customer = receipt.get("customer") or {}
+    tax_num = str(
+        payload.get("buyer_tax_id")
+        or receipt.get("buyer_tax_id")
+        or recipient.get("vatNumber")
+        or recipient.get("identifier")
+        or customer.get("tax_number")
+        or ""
+    ).strip().upper()
+    if not tax_num:
+        return ""
+    # Dacă este marcat ca plătitor de TVA (sau recipient/payload conține vatNumber / is_vat_payer), adăugăm RO
+    is_vat_payer = (
+        tax_num.startswith("RO")
+        or bool(payload.get("is_vat_payer"))
+        or bool(receipt.get("is_vat_payer"))
+        or bool(recipient.get("is_vat_payer"))
+        or bool(recipient.get("vat_payer"))
+        or bool(str(recipient.get("vatNumber") or "").upper().startswith("RO"))
+    )
+    digits = tax_num[2:] if tax_num.startswith("RO") else tax_num
+    return f"RO{digits}" if is_vat_payer else digits
+
+
 # ==================== DATECS (DUDE / FPrinter) DRIVER ====================
 
 class DatecsDriver(BaseFiscalDriver):
@@ -371,29 +412,21 @@ class DatecsDriver(BaseFiscalDriver):
         """Construiește comenzi în format Datecs DUDE nativ (48, 49, 53, 56)."""
         lines = []
         payload = job_payload or {}
-        recipient = receipt.get("recipient") or {}
-        customer = receipt.get("customer") or {}
-        tax_num = str(
-            payload.get("buyer_tax_id")
-            or recipient.get("identifier")
-            or recipient.get("vatNumber")
-            or customer.get("tax_number")
-            or ""
-        ).strip().upper()
-        tax_digits = tax_num[2:] if tax_num.startswith("RO") else tax_num
+        tax_num = resolve_buyer_tax_num(payload, receipt)
 
-        # Comanda 48: Deschidere bon fiscal (I + CUI dacă este persoană juridică)
-        if tax_digits:
-            lines.append(f"48,1\t0001\t1\tI\t{tax_digits}\t")
+        # Comanda 48: Deschidere bon fiscal (I + CUI cu prefix RO dacă este plătitor de TVA)
+        if tax_num:
+            lines.append(f"48,1\t0001\t1\tI\t{tax_num}\t")
         else:
             lines.append("48,1\t0001\t1\t\t\t")
 
         # Comanda 49: Înregistrare articole
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
-            # Linii de text liber/comentariu (ex: referință comandă de lucru)
+            # Linii de text liber/comentariu (ex: referință deviz de lucru)
             if it.get("type") == "comment" or (it.get("unitPrice") is None and it.get("price") is None):
-                txt = (it.get("text") or it.get("name") or it.get("description") or "").strip()[:36].replace("\t", " ")
+                raw_txt = (it.get("text") or it.get("name") or it.get("description") or "").replace("\t", " ")
+                txt = sanitize_comment_text(raw_txt, max_len=36)
                 if txt:
                     lines.append(f"54,{txt}\t")
                 continue
@@ -447,24 +480,16 @@ class DatecsDriver(BaseFiscalDriver):
         """Construiește comenzi în format Datecs FPrinter clasic (S,1,... P,1,... T,1,...)."""
         lines = []
         payload = job_payload or {}
-        recipient = receipt.get("recipient") or {}
-        customer = receipt.get("customer") or {}
-        tax_num = str(
-            payload.get("buyer_tax_id")
-            or recipient.get("identifier")
-            or recipient.get("vatNumber")
-            or customer.get("tax_number")
-            or ""
-        ).strip().upper()
-        tax_digits = tax_num[2:] if tax_num.startswith("RO") else tax_num
-        if tax_digits:
-            lines.append(f"CF,1,______,_,__;{tax_digits};")
+        tax_num = resolve_buyer_tax_num(payload, receipt)
+        if tax_num:
+            lines.append(f"CF,1,______,_,__;{tax_num};")
 
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
             # Comentariu / text informativ (ex. deviz de lucru)
             if it.get("type") == "comment" or (it.get("unitPrice") is None and it.get("price") is None):
-                txt = (it.get("text") or it.get("name") or it.get("description") or "").strip()[:32].replace(";", " ")
+                raw_txt = (it.get("text") or it.get("name") or it.get("description") or "").replace(";", " ")
+                txt = sanitize_comment_text(raw_txt, max_len=32)
                 if txt:
                     lines.append(f"I,1,______,_,__;{txt};")
                 continue
@@ -672,14 +697,7 @@ class TremolDriver(BaseFiscalDriver):
         # C|<cui - max 15>|<denumire - max 30>|<adresa - max 30>
         recipient = receipt.get("recipient") or {}
         customer = receipt.get("customer") or {}
-        cui = str(
-            job_payload.get("buyer_tax_id")
-            or receipt.get("buyer_tax_id")
-            or recipient.get("identifier")
-            or recipient.get("vatNumber")
-            or customer.get("tax_number")
-            or ""
-        ).strip().upper()
+        cui = resolve_buyer_tax_num(job_payload, receipt)
 
         if cui:
             name = (recipient.get("name") or customer.get("name") or job_payload.get("buyer_name") or "Client").strip()[:30].replace("|", " ")
@@ -689,12 +707,13 @@ class TremolDriver(BaseFiscalDriver):
 
         # Articole conform DocumentatieFormatServerTremol.txt:
         # V|<denumire produs>[max 32]`sau~<um max 3>|<tva 0-5>|<pret>|<cantitate>|<-discount>|<tip discount>|<departament>
-        # T|<text liber>[max 35] pentru linii de comentarii / comanda de lucru
+        # T|<text liber>[max 35] pentru linii de comentarii / deviz de lucru
         items = receipt.get("items") or receipt.get("lines") or []
         for it in items:
-            # Comentariu sau text informativ (ex. "Comanda lucru: CL-...")
+            # Comentariu sau text informativ (ex. deviz de lucru)
             if it.get("type") == "comment" or (it.get("unitPrice") is None and it.get("price") is None):
-                txt = (it.get("text") or it.get("name") or it.get("description") or "").strip()[:35].replace("|", " ")
+                raw_txt = (it.get("text") or it.get("name") or it.get("description") or "").replace("|", " ")
+                txt = sanitize_comment_text(raw_txt, max_len=35)
                 if txt:
                     lines.append(f"T|{txt}")
                 continue
