@@ -1299,10 +1299,9 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <input id="deviceToken" type="password" placeholder="Lăsați gol pentru a păstra token-ul salvat">
       </div>
 
-      <div class="row-actions" style="flex-wrap: wrap;">
+      <div class="row-actions">
         <button class="primary" onclick="saveConfiguration()">💾 Salvează Configurația</button>
-        <button class="secondary" onclick="testDriver()">🔌 Test Conexiune Driver</button>
-        <button class="secondary" style="background:#0284c7;" onclick="testReceipt()">🧾 Emite Bon Test (Fișier)</button>
+        <button class="secondary" onclick="testDriver()">🔌 Test Driver Local</button>
         <button class="secondary" onclick="testCloud()">🌐 Test Conexiune Cloud</button>
       </div>
 
@@ -1479,21 +1478,6 @@ async function testDriver() {
   }
 }
 
-async function testReceipt() {
-  const box = document.getElementById('actionMsg');
-  box.style.display = 'block';
-  box.textContent = 'Trimitere bon fiscal de test...';
-  try {
-    const res = await fetch('/service/test-receipt', { method: 'POST' });
-    const jr = await res.json();
-    box.textContent = (jr.ok ? '✓ Bon Fiscal de Test Trimis cu Succes:\n' : '✗ Eroare la Bon Fiscal de Test:\n') + JSON.stringify(jr, null, 2);
-    updateStatus();
-    updateErrors();
-  } catch(e) {
-    box.textContent = '✗ Eroare: ' + e.message;
-  }
-}
-
 async function testCloud() {
   const box = document.getElementById('actionMsg');
   box.style.display = 'block';
@@ -1584,45 +1568,6 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, res)
             except Exception as e:
                 self._send_json(200, {"ok": False, "error": str(e)})
-
-        elif path == "/service/test-receipt":
-            test_job = {
-                "id": f"test_{int(time.time())}",
-                "kind": "fiscal_receipt",
-                "payload": {
-                    "client_cui": "0000000000000",
-                    "buyer_name": "Client Test Sincrona",
-                    "receipt": {
-                        "items": [
-                            {
-                                "name": "Serviciu Auto Test",
-                                "price": 10.00,
-                                "quantity": 1.0,
-                                "taxGroup": 1,
-                                "department": 1,
-                                "unit": "buc"
-                            },
-                            {
-                                "type": "comment",
-                                "text": "Deviz: DV-TEST-001"
-                            }
-                        ],
-                        "payments": [
-                            {
-                                "paymentType": "cash",
-                                "amount": 10.00
-                            }
-                        ]
-                    }
-                }
-            }
-            try:
-                res = FiscalRouter.execute_job(test_job)
-                self._send_json(200, {"ok": True, "result": res})
-            except Exception as e:
-                err_code = getattr(e, "code", "TEST_ERROR")
-                err_text = getattr(e, "text", str(e))
-                self._send_json(200, {"ok": False, "code": err_code, "error": err_text})
 
         elif path == "/service/test-cloud":
             cfg = get_config()
