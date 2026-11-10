@@ -792,7 +792,24 @@ class TremolDriver(BaseFiscalDriver):
         os.rename(tmp_file, target_file)
 
         res = self._wait_for_response(job_name)
-        return {"ok": True, "result": res}
+
+        # Extragem numărul de bon din răspunsul Tremol (ex: 0|OK|1452|TR8765...)
+        receipt_num = ""
+        if res and "|" in res:
+            parts = res.split("|")
+            # Dacă prima parte e '0', bonul a fost cu succes
+            if len(parts) >= 3 and parts[0] == "0":
+                receipt_num = parts[2].strip()
+
+        # Trimitem JSON-ul către Sincrona Cloud folosind cheile standard 
+        # pe care le folosea și ErpNet.FP ca să fie recunoscute instant.
+        return {
+            "ok": True,
+            "result": res,
+            "receiptNumber": receipt_num,
+            "receipt_number": receipt_num,
+            "taskId": task_id,
+        }
 
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
         """
