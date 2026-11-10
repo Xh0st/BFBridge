@@ -555,7 +555,7 @@ class DatecsDriver(BaseFiscalDriver):
         logger.info(f"[Datecs] Scriere fișier {inp_file} ({len(cmd_lines)} linii, cp1250)")
         with open(tmp_file, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(content)
-        # Redenumire atomică pentru a preveni citirea parțială de către driver
+        # Redenumire atomică pentru a preveni citirea parțială
         if os.path.exists(inp_file):
             os.remove(inp_file)
         os.rename(tmp_file, inp_file)
@@ -564,11 +564,35 @@ class DatecsDriver(BaseFiscalDriver):
         res_text = self._wait_for_response(base_name)
         logger.info(f"[Datecs] Răspuns primit pentru {base_name}: {res_text[:100]}")
 
-        # Parsare erori: dacă conține ERR sau -1
-        if "ERR" in res_text.upper() or "ERROR" in res_text.upper():
+        # Parsare erori: dacă conține ERR, ERROR sau începe cu -1
+        upper_res = res_text.upper()
+        if "ERR" in upper_res or "ERROR" in upper_res or res_text.startswith("-1"):
             raise FiscalException("DATECS_REJECTED", f"Datecs a raportat eroare: {res_text}")
 
-        return {"ok": True, "raw_response": res_text, "file": base_name}
+        # Parsare număr bon (Extragere)
+        # De regulă Datecs răspunde: 0;0;0;[NumarBon];... sau ceva similar
+        receipt_num = ""
+        parts = res_text.split(";")
+        if len(parts) >= 4:
+            # Încercăm să luăm indexul 3 (al 4-lea element) dacă e număr
+            if parts[3].strip().isdigit():
+                receipt_num = parts[3].strip()
+            # Fallback: căutăm prima secvență lungă de cifre
+            else:
+                for p in parts:
+                    clean_p = p.strip()
+                    if clean_p.isdigit() and len(clean_p) >= 1:
+                        receipt_num = clean_p
+                        break
+
+        return {
+            "ok": True,
+            "result": res_text,
+            "file": base_name,
+            "receiptNumber": receipt_num,
+            "receipt_number": receipt_num,
+            "taskId": task_id,
+        }
 
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
         low_type = report_type.lower().replace("_", "")
