@@ -387,10 +387,21 @@ class DatecsDriver(BaseFiscalDriver):
     def test_connection(self) -> dict:
         in_ok = os.path.isdir(self.in_dir) and os.access(self.in_dir, os.W_OK)
         out_ok = os.path.isdir(self.out_dir) and os.access(self.out_dir, os.R_OK)
+        probe_ok = False
+        probe_file = os.path.join(self.in_dir, f".probe_{int(time.time())}.tmp")
+        try:
+            with open(probe_file, "w") as f:
+                f.write("probe")
+            if os.path.exists(probe_file):
+                os.remove(probe_file)
+                probe_ok = True
+        except Exception:
+            probe_ok = False
+
         return {
-            "ok": in_ok and out_ok,
+            "ok": in_ok and out_ok and probe_ok,
             "in_dir": self.in_dir,
-            "in_dir_writable": in_ok,
+            "in_dir_writable": in_ok and probe_ok,
             "out_dir": self.out_dir,
             "out_dir_readable": out_ok,
             "format": self.format_mode
@@ -419,7 +430,7 @@ class DatecsDriver(BaseFiscalDriver):
 
         if not found_file:
             # Caută orice fișier .out/.err modificat recent
-            raise FiscalException("DATECS_TIMEOUT", f"Nu s-a primit fișier de răspuns în {self.out_dir} în {self.timeout_s}s.")
+            raise FiscalException("DATECS_TIMEOUT", f"Fișierul {base_name}.inp a fost creat în {self.in_dir}, dar nu s-a primit fișier de răspuns în {self.out_dir} în {self.timeout_s}s. Asigurați-vă că driverul Datecs (DUDE / FPrinter sau simulatorul) rulează.")
 
         # Așteaptă scrierea completă
         time.sleep(0.2)
@@ -468,7 +479,8 @@ class DatecsDriver(BaseFiscalDriver):
             lines.append(f"49,{name}\t{vat}\t{price}\t{qty}\t\t\t{dep}\t{um}\t")
 
         # Comanda 53: Înregistrare plăți
-        # Mapare tip plată Datecs DUDE: 0=Numerar, 1=Card, 2=Tichete Masă, 3=Tichete Cadou, 4=Credit, etc.
+        # Mapare tip plată Datecs DUDE (conf. FP_Protocol_RO.pdf pag. 22):
+        # 0=Numerar, 1=Card, 2=Tichete Masă, 3=Tichete Valorice, 4=Voucher, 5=Credit, 6=Plată modernă, 8=Alte/Bank
         payment_map = {
             "cash": 0,
             "numerar": 0,
@@ -477,12 +489,16 @@ class DatecsDriver(BaseFiscalDriver):
             "ticket": 2,
             "tichet": 2,
             "tichete": 2,
-            "voucher": 3,
-            "credit": 4,
+            "ticket_val": 3,
+            "voucher": 4,
+            "credit": 5,
+            "modern": 6,
             "bank": 8,
             "virament": 8,
             "op": 8,
             "other": 8,
+            "alta": 8,
+            "alte": 8,
         }
         payments = receipt.get("payments") or []
         if not payments:
@@ -585,6 +601,13 @@ class DatecsDriver(BaseFiscalDriver):
                         receipt_num = clean_p
                         break
 
+        # Curățare fișier procesat .inp din folderul IN
+        try:
+            if os.path.exists(inp_file):
+                os.remove(inp_file)
+        except OSError:
+            pass
+
         return {
             "ok": True,
             "result": res_text,
@@ -654,10 +677,21 @@ class TremolDriver(BaseFiscalDriver):
     def test_connection(self) -> dict:
         in_ok = os.path.isdir(self.in_dir) and os.access(self.in_dir, os.W_OK)
         out_ok = os.path.isdir(self.out_dir) and os.access(self.out_dir, os.R_OK)
+        probe_ok = False
+        probe_file = os.path.join(self.in_dir, f".probe_{int(time.time())}.tmp")
+        try:
+            with open(probe_file, "w") as f:
+                f.write("probe")
+            if os.path.exists(probe_file):
+                os.remove(probe_file)
+                probe_ok = True
+        except Exception:
+            probe_ok = False
+
         return {
-            "ok": in_ok and out_ok,
+            "ok": in_ok and out_ok and probe_ok,
             "in_dir": self.in_dir,
-            "in_dir_writable": in_ok,
+            "in_dir_writable": in_ok and probe_ok,
             "out_dir": self.out_dir,
             "out_dir_readable": out_ok
         }
@@ -730,7 +764,7 @@ class TremolDriver(BaseFiscalDriver):
                 raise FiscalException("TREMOL_ERROR", "Fișierul a fost mutat în error/bad de către ServerTremol")
             return "OK (Fișier prelucrat de Tremol)"
 
-        raise FiscalException("TREMOL_TIMEOUT", f"Tremol nu a procesat bonul în {self.timeout_s}s. Verificați că ServerTremol.exe rulează și casa este conectată în REG.OPER.")
+        raise FiscalException("TREMOL_TIMEOUT", f"Fișierul {job_name}.txt a fost creat în {self.in_dir}, dar Tremol nu a procesat bonul în {self.timeout_s}s. Verificați că ServerTremol.exe rulează și casa este conectată în REG.OPER.")
 
     def print_receipt(self, job_payload: dict, task_id: str) -> dict:
         """
@@ -1265,9 +1299,10 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <input id="deviceToken" type="password" placeholder="Lăsați gol pentru a păstra token-ul salvat">
       </div>
 
-      <div class="row-actions">
+      <div class="row-actions" style="flex-wrap: wrap;">
         <button class="primary" onclick="saveConfiguration()">💾 Salvează Configurația</button>
-        <button class="secondary" onclick="testDriver()">🔌 Test Driver Local</button>
+        <button class="secondary" onclick="testDriver()">🔌 Test Conexiune Driver</button>
+        <button class="secondary" style="background:#0284c7;" onclick="testReceipt()">🧾 Emite Bon Test (Fișier)</button>
         <button class="secondary" onclick="testCloud()">🌐 Test Conexiune Cloud</button>
       </div>
 
@@ -1444,6 +1479,21 @@ async function testDriver() {
   }
 }
 
+async function testReceipt() {
+  const box = document.getElementById('actionMsg');
+  box.style.display = 'block';
+  box.textContent = 'Trimitere bon fiscal de test...';
+  try {
+    const res = await fetch('/service/test-receipt', { method: 'POST' });
+    const jr = await res.json();
+    box.textContent = (jr.ok ? '✓ Bon Fiscal de Test Trimis cu Succes:\n' : '✗ Eroare la Bon Fiscal de Test:\n') + JSON.stringify(jr, null, 2);
+    updateStatus();
+    updateErrors();
+  } catch(e) {
+    box.textContent = '✗ Eroare: ' + e.message;
+  }
+}
+
 async function testCloud() {
   const box = document.getElementById('actionMsg');
   box.style.display = 'block';
@@ -1534,6 +1584,45 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, res)
             except Exception as e:
                 self._send_json(200, {"ok": False, "error": str(e)})
+
+        elif path == "/service/test-receipt":
+            test_job = {
+                "id": f"test_{int(time.time())}",
+                "kind": "fiscal_receipt",
+                "payload": {
+                    "client_cui": "0000000000000",
+                    "buyer_name": "Client Test Sincrona",
+                    "receipt": {
+                        "items": [
+                            {
+                                "name": "Serviciu Auto Test",
+                                "price": 10.00,
+                                "quantity": 1.0,
+                                "taxGroup": 1,
+                                "department": 1,
+                                "unit": "buc"
+                            },
+                            {
+                                "type": "comment",
+                                "text": "Deviz: DV-TEST-001"
+                            }
+                        ],
+                        "payments": [
+                            {
+                                "paymentType": "cash",
+                                "amount": 10.00
+                            }
+                        ]
+                    }
+                }
+            }
+            try:
+                res = FiscalRouter.execute_job(test_job)
+                self._send_json(200, {"ok": True, "result": res})
+            except Exception as e:
+                err_code = getattr(e, "code", "TEST_ERROR")
+                err_text = getattr(e, "text", str(e))
+                self._send_json(200, {"ok": False, "code": err_code, "error": err_text})
 
         elif path == "/service/test-cloud":
             cfg = get_config()
