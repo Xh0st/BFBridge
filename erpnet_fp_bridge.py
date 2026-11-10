@@ -241,7 +241,17 @@ class ErpNetFPDriver(BaseFiscalDriver):
         receipt_body = job_payload.get("receipt") or job_payload.get("body") or {}
         local_url = job_payload.get("erpnet_url", self.erpnet_url).rstrip("/")
 
-        endpoint = job_payload.get("endpoint") or "receipt"
+        tax_num = resolve_buyer_tax_num(job_payload, receipt_body)
+        if tax_num:
+            recip = receipt_body.setdefault("recipient", {})
+            recip.setdefault("name", job_payload.get("buyer_name") or receipt_body.get("buyer_name") or "Client")
+            recip.setdefault("identifier", tax_num)
+            recip["uniqueRegistrationNumber"] = tax_num
+            if not (len(tax_num) == 13 and tax_num.isdigit()):
+                if tax_num.startswith("RO"):
+                    recip["vatNumber"] = tax_num
+
+        endpoint = job_payload.get("endpoint") or ("invoice" if tax_num else "receipt")
         logger.info(f"[ErpNet] Trimitere către {local_url}/printers/{printer_id}/{endpoint} (taskId={task_id})")
 
         try:
@@ -315,19 +325,36 @@ def sanitize_comment_text(txt: str, max_len: int = 35) -> str:
 
 
 def resolve_buyer_tax_num(payload: dict, receipt: dict) -> str:
-    """Extrage CUI-ul cumpărătorului și păstrează/adaugă prefixul RO dacă este plătitor de TVA."""
-    recipient = receipt.get("recipient") or {}
-    customer = receipt.get("customer") or {}
+    """Extrage CUI-ul/CNP-ul cumpărătorului:
+    - Pentru Persoane Fizice (PF / B2C): CNP (13 cifre) sau '0000000000000' (13 zerouri) — NICIODATĂ prefixat cu RO.
+    - Pentru Persoane Juridice (PJ): CUI/CIF-ul cumpărătorului (cu prefixul RO dacă este plătitor de TVA).
+    """
+    payload = payload or {}
+    receipt = receipt or {}
+    recipient = receipt.get("recipient") or payload.get("recipient") or {}
+    customer = receipt.get("customer") or payload.get("customer") or {}
     tax_num = str(
-        payload.get("buyer_tax_id")
+        payload.get("client_cui")
+        or receipt.get("client_cui")
+        or payload.get("buyer_tax_id")
         or receipt.get("buyer_tax_id")
-        or recipient.get("vatNumber")
+        or recipient.get("uniqueRegistrationNumber")
         or recipient.get("identifier")
+        or recipient.get("vatNumber")
         or customer.get("tax_number")
         or ""
     ).strip().upper()
     if not tax_num:
         return ""
+
+    digits_only = re.sub(r"\D", "", tax_num)
+
+    # Persoane Fizice (PF / B2C): 13 cifre (CNP sau 0000000000000)
+    # În România, CUI PJ are maxim 10 cifre; CNP are exact 13 cifre.
+    if len(digits_only) == 13:
+        return digits_only
+
+    # Persoane Juridice (PJ):
     # Dacă este marcat ca plătitor de TVA (sau recipient/payload conține vatNumber / is_vat_payer), adăugăm RO
     is_vat_payer = (
         tax_num.startswith("RO")
