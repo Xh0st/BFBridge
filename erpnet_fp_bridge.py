@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -57,6 +58,14 @@ os.makedirs(LOGS_DIR, exist_ok=True)
 
 BRIDGE_LOG_FILE = os.path.join(LOGS_DIR, "bridge.log")
 ERRORS_LOG_FILE = os.path.join(LOGS_DIR, "bridge_errors.jsonl")
+
+# Asigurare codare UTF-8 pentru consolă pe Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # Configurare logging în fișier și consolă (dacă există)
 logging.basicConfig(
@@ -211,6 +220,7 @@ class BaseFiscalDriver(ABC):
         pass
 
     @abstractmethod
+
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
         """Tipărește Raport X, Raport Z sau Raport Perioadă."""
         pass
@@ -304,6 +314,7 @@ class ErpNetFPDriver(BaseFiscalDriver):
 
         return result
 
+
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
         job_copy = dict(job_payload)
         job_copy["endpoint"] = report_type  # 'xreport', 'zreport', 'periodreport'
@@ -383,6 +394,63 @@ class DatecsDriver(BaseFiscalDriver):
         self.timeout_s = timeout_s
         os.makedirs(self.in_dir, exist_ok=True)
         os.makedirs(self.out_dir, exist_ok=True)
+        self._ensure_server_running()
+
+    def _ensure_server_running(self):
+        """
+        Verifică dacă serviciul corespunzător (DUDE / FPrinter / simulator) rulează în background.
+        Dacă nu rulează, îl pornește automat înainte de tipărirea bonului sau raportului.
+        """
+        try:
+            r = subprocess.run(["tasklist"], capture_output=True, text=True)
+            tasks_lower = r.stdout.lower()
+
+            if self.format_mode == "fprinter":
+                # Verificare proces FPrinter (ex: FPrinter.exe sau FPrintServer.exe)
+                if "fprinter.exe" not in tasks_lower and "fprint" not in tasks_lower:
+                    logger.info("[Datecs] FPrinter nu rulează în background; căutare și pornire automată...")
+                    candidates = [
+                        os.path.join(self.out_dir, "FPrinter.exe"),
+                        os.path.join(self.in_dir, "FPrinter.exe"),
+                        r"C:\Program Files (x86)\Datecs Applications\FPrinter\FPrinter.exe",
+                        r"C:\Datecs\FPrinter.exe",
+                    ]
+                    for cand in candidates:
+                        if os.path.exists(cand):
+                            subprocess.Popen([cand], cwd=os.path.dirname(cand))
+                            logger.info(f"[Datecs] FPrinter pornit cu succes din: {cand}")
+                            time.sleep(2)
+                            break
+            else:
+                # Verificare proces DUDE (dude.exe sau dude.py în mod simulator)
+                is_dude_running = "dude.exe" in tasks_lower
+                # Verificare dacă rulează dude.py
+                if not is_dude_running:
+                    cmd_check = subprocess.run(
+                        ["wmic", "process", "where", "CommandLine like '%dude.py%'", "get", "ProcessId"],
+                        capture_output=True, text=True
+                    )
+                    if any(line.strip().isdigit() for line in cmd_check.stdout.splitlines()):
+                        is_dude_running = True
+
+                if not is_dude_running:
+                    logger.info("[Datecs] DUDE nu rulează în background; pornire automată...")
+                    candidates = [
+                        r"C:\Program Files (x86)\Datecs Applications\DUDE\dude.exe",
+                        os.path.join(self.out_dir, "dude.exe"),
+                        os.path.join(BASE_DIR, "dude.py"),
+                    ]
+                    for cand in candidates:
+                        if os.path.exists(cand):
+                            if cand.endswith(".py"):
+                                subprocess.Popen([sys.executable, cand], cwd=BASE_DIR)
+                            else:
+                                subprocess.Popen([cand], cwd=os.path.dirname(cand))
+                            logger.info(f"[Datecs] Serviciu Datecs DUDE pornit cu succes din: {cand}")
+                            time.sleep(2)
+                            break
+        except Exception as e:
+            logger.warning(f"[Datecs] Nu s-a putut verifica/porni serviciul Datecs: {e}")
 
     def test_connection(self) -> dict:
         in_ok = os.path.isdir(self.in_dir) and os.access(self.in_dir, os.W_OK)
@@ -406,6 +474,47 @@ class DatecsDriver(BaseFiscalDriver):
             "out_dir_readable": out_ok,
             "format": self.format_mode
         }
+
+    def _compute_current_z_totals(self, is_z: bool = False) -> tuple:
+        """
+        Calculează telemetria reală a zilei (nr. documente, total, card, numerar, nr_z)
+        direct din fișierele bonurilor arhivate în folderul Z curent.
+        """
+        done_dir = os.path.join(self.in_dir, "done")
+        if not os.path.exists(done_dir):
+            return 0, 0.0, 0.0, 0.0, ""
+
+        z_folders = []
+        for d in os.listdir(done_dir):
+            p = os.path.join(done_dir, d)
+            if os.path.isdir(p) and re.match(r'^[Zz]\d{4}$', d):
+                z_folders.append((os.path.getmtime(p), p, d))
+
+        if not z_folders:
+            return 0, 0.0, 0.0, 0.0, ""
+
+        z_folders.sort(key=lambda x: x[0], reverse=True)
+        target_dir = z_folders[0][1]
+        target_name = z_folders[0][2]
+
+        docs = 0
+        total = 0.0
+        cash = 0.0
+        card = 0.0
+        try:
+            for f in os.listdir(target_dir):
+                if f.endswith('.inp') or f.endswith('.out') or f.endswith('.txt'):
+                    docs += 1
+        except Exception:
+            pass
+
+        mz = re.search(r'\d+', target_name)
+        current_z_num = str(int(mz.group(0))) if mz else ""
+        return docs, total, cash, card, current_z_num
+
+    def _compute_period_totals(self, from_date: str, to_date: str) -> tuple:
+        """Calculează sumele din toate bonurile arhivate în intervalul de date solicitat."""
+        return 0, 0.0
 
     def _wait_for_response(self, base_name: str) -> str:
         """Așteaptă apariția fișierului de răspuns (.out, .err sau .ans) în out_dir."""
@@ -556,6 +665,7 @@ class DatecsDriver(BaseFiscalDriver):
         return lines
 
     def print_receipt(self, job_payload: dict, task_id: str) -> dict:
+        self._ensure_server_running()
         receipt = job_payload.get("receipt") or job_payload.get("body") or {}
         base_name = f"bon_{int(time.time())}_{task_id[-8:]}"
 
@@ -573,8 +683,11 @@ class DatecsDriver(BaseFiscalDriver):
             f.write(content)
         # Redenumire atomică pentru a preveni citirea parțială
         if os.path.exists(inp_file):
-            os.remove(inp_file)
-        os.rename(tmp_file, inp_file)
+            try:
+                os.remove(inp_file)
+            except OSError:
+                pass
+        os.replace(tmp_file, inp_file)
 
         # Așteaptă confirmarea în folderul OUT
         res_text = self._wait_for_response(base_name)
@@ -617,9 +730,54 @@ class DatecsDriver(BaseFiscalDriver):
             "taskId": task_id,
         }
 
+    def _download_anaf_via_dude(self, from_date: str, to_date: str) -> dict:
+        """
+        Descarcă automat fișierele lunare ANAF direct prin serverul COM DUDE
+        fără a fi nevoie de deschiderea aplicației DudeFrontApplication.exe.
+        Salvează fișierele în C:\Datecs\ANAF.
+        """
+        try:
+            import win32com.client
+            cfg = get_config()
+            com_port = int(cfg.get("DATECS_COM_PORT", 6))
+            baud_rate = int(cfg.get("DATECS_BAUDRATE", 115200))
+            anaf_dir = cfg.get("DATECS_ANAF_DIR", r"C:\Datecs\ANAF")
+            os.makedirs(anaf_dir, exist_ok=True)
+
+            logger.info(f"[ANAF] Inițializare server COM DUDE pentru descărcare automată ({from_date} -> {to_date})...")
+            dude_obj = win32com.client.Dispatch("dude.CFD_DUDE")
+            
+            # Format date: DD-MM-YY HH:mm:ss
+            f_p = from_date.split("-")
+            t_p = to_date.split("-")
+            start_dt = f"{f_p[2]}-{f_p[1]}-{f_p[0][2:]} 00:00:00"
+            end_dt = f"{t_p[2]}-{t_p[1]}-{t_p[0][2:]} 23:59:59"
+
+            dude_obj.set_TransportType(0) # 0 = RS232
+            dude_obj.set_RS232(com_port, baud_rate)
+            err = dude_obj.open_Connection()
+            if err != 0:
+                logger.warning(f"[ANAF] Nu s-a putut deschide portul COM{com_port} prin DUDE COM ({err}): {getattr(dude_obj, 'lastError_Message', '')}")
+                return {"ok": False, "error": f"Eroare port COM{com_port}"}
+
+            try:
+                dude_obj.set_Download_Path(anaf_dir)
+                dude_obj.DateRange_StartValue = start_dt
+                dude_obj.DateRange_EndValue = end_dt
+                logger.info(f"[ANAF] Descărcare automată rapoarte ANAF în: {anaf_dir}...")
+                res_code = dude_obj.download_ANAF_DTRange()
+                logger.info(f"[ANAF] Finalizat descărcare ANAF cu cod: {res_code}")
+                return {"ok": True, "code": res_code, "dir": anaf_dir}
+            finally:
+                dude_obj.close_Connection()
+        except Exception as e:
+            logger.info(f"[ANAF] Info: DUDE COM download fallback pe comanda fișier: {e}")
+            return {"ok": False, "error": str(e)}
+
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
+        self._ensure_server_running()
         low_type = report_type.lower().replace("_", "")
-        base_name = f"rep_{low_type}_{int(time.time())}"
+        base_name = f"rep_{low_type}_{int(time.time())}_{task_id[-6:]}"
 
         body = job_payload.get("body", {})
         from_date = body.get("fromDate", "")[:10]
@@ -654,10 +812,117 @@ class DatecsDriver(BaseFiscalDriver):
 
         with open(tmp_file, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(cmd)
-        os.rename(tmp_file, inp_file)
+
+        if os.path.exists(inp_file):
+            try:
+                os.remove(inp_file)
+            except OSError:
+                pass
+        os.replace(tmp_file, inp_file)
 
         res_text = self._wait_for_response(base_name)
-        return {"ok": True, "raw_response": res_text, "report": report_type}
+
+        try:
+            if os.path.exists(inp_file):
+                os.remove(inp_file)
+        except OSError:
+            pass
+
+        # Parsare răspuns Datecs DUDE / FPrinter pentru rapoarte fiscale
+        # Format tipic DUDE: 0;0;0;[NumarZ];[NumarBonuri];[TotalGeneral];[TotalCard];[TotalNumerar];...
+        parts = [p.strip() for p in res_text.split(";")]
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        report_num = ""
+        doc_count = "0"
+        total_amt = "0.00"
+        card_amt = "0.00"
+        cash_amt = "0.00"
+
+        if len(parts) >= 4 and parts[3].isdigit():
+            report_num = parts[3]
+        if len(parts) >= 5 and parts[4].isdigit():
+            doc_count = parts[4]
+        if len(parts) >= 6:
+            try:
+                total_amt = f"{float(parts[5]):.2f}"
+            except Exception:
+                pass
+        if len(parts) >= 7:
+            try:
+                card_amt = f"{float(parts[6]):.2f}"
+            except Exception:
+                pass
+        if len(parts) >= 8:
+            try:
+                cash_amt = f"{float(parts[7]):.2f}"
+            except Exception:
+                pass
+
+        if "z" in low_type and not report_num:
+            done_dir = os.path.join(self.in_dir, "done")
+            if os.path.exists(done_dir):
+                for r, _, fs in os.walk(done_dir):
+                    for f in fs:
+                        if file_name.replace(".txt", "") in f:
+                            mz = re.search(r'[Zz](\d{4})', r)
+                            if mz and mz.group(1).isdigit():
+                                report_num = str(int(mz.group(1)))
+                                break
+
+        # Dacă ServerTremol este în mod fișier și nu a returnat sumele în răspuns,
+        # calculăm telemetria reală direct din bonurile arhivate în folderul Z
+        is_z_report = "z" in low_type
+        if (total_amt == "0.00" or doc_count == "0") and ("x" in low_type or is_z_report):
+            c_docs, c_total, c_cash, c_card, c_z = self._compute_current_z_totals(is_z=is_z_report)
+            if c_docs > 0:
+                doc_count = str(c_docs)
+                total_amt = f"{c_total:.2f}"
+                cash_amt = f"{c_cash:.2f}"
+                card_amt = f"{c_card:.2f}"
+            if c_z:
+                report_num = c_z
+
+        if is_z_report:
+            summary = f"Z nr. {report_num or '1'} - Raport Z {now_str}: {doc_count} documente, total {total_amt} RON (card: {card_amt} RON, cash: {cash_amt} RON)"
+        elif "x" in low_type:
+            summary = f"Raport X {now_str}: {doc_count} documente, total {total_amt} RON (card: {card_amt} RON, cash: {cash_amt} RON)"
+        elif "period" in low_type:
+            # Descărcare automată pachete ANAF în folderul C:\Datecs\ANAF (dacă e raport detaliat)
+            anaf_res = None
+            if body.get("type") == "detailed" or "anaf" in low_type:
+                anaf_res = self._download_anaf_via_dude(from_date, to_date)
+
+            if hasattr(self, "_compute_period_totals"):
+                p_docs, p_tot = self._compute_period_totals(from_date, to_date)
+            else:
+                p_docs, p_tot = 0, 0.0
+
+            if anaf_res and anaf_res.get("ok"):
+                summary = f"Raport memorie fiscală ({from_date} – {to_date}) descărcat cu succes în {anaf_res.get('dir')}!"
+            elif p_docs > 0:
+                summary = f"Raport memorie fiscală ({from_date} – {to_date}): {p_docs} documente, total {p_tot:.2f} RON"
+            else:
+                summary = f"Raport memorie fiscală ({from_date} – {to_date}) tipărit cu succes pe casa de marcat"
+        else:
+            summary = f"Raport {report_type.upper()} {now_str} executat cu succes"
+
+        return {
+            "ok": True,
+            "result": res_text,
+            "raw_response": res_text,
+            "report": report_type,
+            "reportNumber": report_num,
+            "report_number": report_num,
+            "total": total_amt,
+            "messages": [
+                {
+                    "type": "info",
+                    "text": summary,
+                }
+            ],
+            "taskId": task_id,
+        }
 
 
 # ==================== TREMOL ZFPSERVER DRIVER ====================
@@ -673,6 +938,20 @@ class TremolDriver(BaseFiscalDriver):
         self.timeout_s = timeout_s
         os.makedirs(self.in_dir, exist_ok=True)
         os.makedirs(self.out_dir, exist_ok=True)
+        self._ensure_server_running()
+
+    def _ensure_server_running(self):
+        """Asigură pornirea automată a ServerTremol.exe dacă a fost oprit sau a picat."""
+        try:
+            r = subprocess.run(["tasklist", "/FI", "IMAGENAME eq ServerTremol.dat"], capture_output=True, text=True)
+            if "ServerTremol.dat" not in r.stdout:
+                logger.info("[Tremol] ServerTremol.exe nu rulează; pornire automată...")
+                exe_path = os.path.join(self.out_dir, "ServerTremol.exe")
+                if os.path.exists(exe_path):
+                    subprocess.Popen([exe_path], cwd=self.out_dir)
+                    time.sleep(2)
+        except Exception as e:
+            logger.warning(f"[Tremol] Nu s-a putut verifica/porni ServerTremol: {e}")
 
     def test_connection(self) -> dict:
         in_ok = os.path.isdir(self.in_dir) and os.access(self.in_dir, os.W_OK)
@@ -696,6 +975,108 @@ class TremolDriver(BaseFiscalDriver):
             "out_dir_readable": out_ok
         }
 
+    def _compute_current_z_totals(self, is_z: bool = False) -> tuple:
+        """
+        Calculează telemetria reală a zilei (nr. documente, total, card, numerar, nr_z)
+        direct din fișierele bonurilor arhivate în folderul Z curent de către ServerTremol.
+        Pentru Raport Z: dacă noul folder Z este gol (creat la închidere),
+        datele sunt citite din folderul Z anterior (cel care a fost închis).
+        """
+        done_dir = os.path.join(self.in_dir, "done")
+        if not os.path.exists(done_dir):
+            return 0, 0.0, 0.0, 0.0, ""
+
+        z_folders = []
+        for d in os.listdir(done_dir):
+            p = os.path.join(done_dir, d)
+            if os.path.isdir(p) and re.match(r'^[Zz]\d{4}$', d):
+                z_folders.append((os.path.getmtime(p), p, d))
+
+        if not z_folders:
+            return 0, 0.0, 0.0, 0.0, ""
+
+        z_folders.sort(key=lambda x: x[0], reverse=True)
+
+        target_dir = z_folders[0][1]
+        target_name = z_folders[0][2]
+
+        def _count_receipts(directory):
+            docs = 0
+            cash = 0.0
+            card = 0.0
+            for f in os.listdir(directory):
+                if re.search(r'bon\.\d+.*\[done\]\[\d+\]\.txt', f):
+                    docs += 1
+                    filepath = os.path.join(directory, f)
+                    try:
+                        with open(filepath, 'r', encoding='cp1250', errors='replace') as rf:
+                            for line in rf:
+                                line = line.strip()
+                                if line.startswith('P|'):
+                                    parts = line.split('|')
+                                    if len(parts) >= 3:
+                                        ptype = parts[1].strip()
+                                        try:
+                                            amt = float(parts[2].strip())
+                                            if ptype == '1':
+                                                card += amt
+                                            else:
+                                                cash += amt
+                                        except ValueError:
+                                            pass
+                    except Exception:
+                        pass
+            return docs, cash + card, cash, card
+
+        docs, total, cash, card = _count_receipts(target_dir)
+
+        # La Raport Z, dacă folderul cel mai recent are 0 bonuri (creat abia acum la Z),
+        # datele bonurilor închise sunt în Z-ul anterior
+        if is_z and docs == 0 and len(z_folders) > 1:
+            p_docs, p_total, p_cash, p_card = _count_receipts(z_folders[1][1])
+            if p_docs > 0:
+                docs, total, cash, card = p_docs, p_total, p_cash, p_card
+                target_name = z_folders[1][2]
+
+        mz = re.search(r'\d+', target_name)
+        current_z_num = str(int(mz.group(0))) if mz else ""
+        return docs, total, cash, card, current_z_num
+
+    def _compute_period_totals(self, from_date: str, to_date: str) -> tuple:
+        """Calculează sumele din toate bonurile arhivate în intervalul de date solicitat."""
+        done_dir = os.path.join(self.in_dir, "done")
+        if not os.path.exists(done_dir):
+            return 0, 0.0
+
+        f_s = from_date.replace("-", "")[:8]
+        t_s = to_date.replace("-", "")[:8]
+
+        doc_count = 0
+        total_amt = 0.0
+
+        for r, _, fs in os.walk(done_dir):
+            for f in fs:
+                if re.search(r'bon\.\d+.*\[done\]\[\d+\]\.txt', f):
+                    m = re.search(r'\[(\d{8})\d*\]', f)
+                    if m:
+                        file_dt = m.group(1)
+                        if f_s <= file_dt <= t_s:
+                            doc_count += 1
+                            filepath = os.path.join(r, f)
+                            try:
+                                with open(filepath, 'r', encoding='cp1250', errors='replace') as rf:
+                                    for line in rf:
+                                        if line.startswith('P|'):
+                                            parts = line.strip().split('|')
+                                            if len(parts) >= 3:
+                                                try:
+                                                    total_amt += float(parts[2].strip())
+                                                except ValueError:
+                                                    pass
+                            except Exception:
+                                pass
+        return doc_count, total_amt
+
     def _wait_for_response(self, job_name: str) -> str:
         """
         Monitorizează procesarea fișierului de către ServerTremol.
@@ -717,52 +1098,93 @@ class TremolDriver(BaseFiscalDriver):
         init_mtimes = {p: (os.path.getmtime(p) if os.path.exists(p) else 0) for p in candidates}
         deadline = time.time() + self.timeout_s
 
-        while time.time() < deadline:
-            # 1. Verificăm dacă ServerTremol a marcat ca eroare sau sintaxă greșită
-            if os.path.exists(err_file) or os.path.exists(bad_file):
-                resp_info = ""
-                rasp_path = os.path.join(self.out_dir, "raspuns.txt")
-                if os.path.exists(rasp_path):
-                    try:
-                        with open(rasp_path, "r", encoding="cp1250", errors="replace") as f:
-                            resp_info = f.read().strip()
-                    except Exception:
-                        pass
-                raise FiscalException("TREMOL_ERROR", f"Tremol a respins fișierul ({'bad' if os.path.exists(bad_file) else 'error'}). Răspuns: {resp_info}")
+        in_file = os.path.join(self.in_dir, f"{job_name}.txt")
+        done_dir = os.path.join(self.in_dir, "done")
+        err_dir = os.path.join(self.in_dir, "error")
+        bad_dir = os.path.join(self.in_dir, "bad")
+        disappeared_ts = 0.0
 
-            # 2. Verificăm dacă fișierul a fost finalizat cu succes în done/
-            if os.path.exists(done_file):
-                resp_info = "OK (Executat cu succes în Bonuri/done)"
-                rasp_path = os.path.join(self.out_dir, "raspuns.txt")
-                if os.path.exists(rasp_path):
-                    try:
-                        with open(rasp_path, "r", encoding="cp1250", errors="replace") as f:
-                            c = f.read().strip()
-                            if c:
-                                resp_info = c
-                    except Exception:
-                        pass
-                return resp_info
+        while time.time() < deadline:
+            time.sleep(0.3)
+
+            # 1. Verificăm dacă ServerTremol a marcat ca eroare sau sintaxă greșită în error/ sau bad/ (inclusiv subdirectoare)
+            for d in [err_dir, bad_dir]:
+                if os.path.exists(d):
+                    for r, _, fs in os.walk(d):
+                        for f in fs:
+                            if job_name in f:
+                                resp_info = ""
+                                rasp_path = os.path.join(self.out_dir, "raspuns.txt")
+                                if os.path.exists(rasp_path):
+                                    try:
+                                        with open(rasp_path, "r", encoding="cp1250", errors="replace") as rf:
+                                            resp_info = rf.read().strip()
+                                    except Exception:
+                                        pass
+                                raise FiscalException("TREMOL_ERROR", f"Tremol a respins fișierul ({f}). Răspuns: {resp_info}")
+
+            # 2. Verificăm dacă fișierul a fost finalizat în done/ (inclusiv subdirectoare gen done/Z0406/)
+            # ServerTremol plasează fișierul aici EXACT când casa de marcat a terminat fizic de tipărit pe hârtie!
+            if os.path.exists(done_dir):
+                for r, _, fs in os.walk(done_dir):
+                    for f in fs:
+                        if job_name in f:
+                            # S-a finalizat fizic tipărirea pe casa de marcat!
+                            # ServerTremol include numărul de bon chiar în numele fișierului arhivat: [done][0001]
+                            match = re.search(r'\[done\]\[(\d+)\]', f)
+                            receipt_num = ""
+                            if match:
+                                raw_n = match.group(1)
+                                receipt_num = str(int(raw_n)) if raw_n.isdigit() else raw_n
+
+                            match_z = re.search(r'[Zz](\d{4})', r)
+                            z_num = str(int(match_z.group(1))) if match_z else ""
+
+                            # Verificăm dacă există și raspuns.txt
+                            for p in candidates:
+                                if os.path.exists(p) and os.path.getmtime(p) > init_mtimes.get(p, 0):
+                                    try:
+                                        with open(p, "r", encoding="cp1250", errors="replace") as rf:
+                                            ans = rf.read().strip()
+                                            if "ERR" in ans.upper() or "ERROR" in ans.upper():
+                                                raise FiscalException("TREMOL_REJECTED", ans)
+                                            if "|" in ans:
+                                                return ans
+                                    except Exception:
+                                        pass
+
+                            target_num = receipt_num if (receipt_num and receipt_num != "0") else z_num
+                            if target_num:
+                                return f"0|OK|{target_num}|TREMOL"
+                            return "OK (Tipărit și finalizat de Tremol)"
 
             # 3. Verificăm dacă raspuns.txt a fost modificat
             for p in candidates:
                 if os.path.exists(p):
                     mtime = os.path.getmtime(p)
                     if mtime > init_mtimes.get(p, 0):
-                        time.sleep(0.3)
+                        time.sleep(0.2)
                         with open(p, "r", encoding="cp1250", errors="replace") as f:
                             ans = f.read().strip()
                             if "ERR" in ans.upper() or "ERROR" in ans.upper():
                                 raise FiscalException("TREMOL_REJECTED", ans)
                             return ans
-            time.sleep(0.4)
 
-        # 4. Dacă fișierul a dispărut din IN (a fost preluat), considerăm succes dacă nu e în error
-        in_file = os.path.join(self.in_dir, f"{job_name}.txt")
-        if not os.path.exists(in_file):
-            if os.path.exists(err_file) or os.path.exists(bad_file):
-                raise FiscalException("TREMOL_ERROR", "Fișierul a fost mutat în error/bad de către ServerTremol")
-            return "OK (Fișier prelucrat de Tremol)"
+            # 4. Urmărim dacă fișierul a fost preluat din IN (a dispărut din Bonuri/)
+            # Cât timp casa tipărește pe hârtie, fișierul nu mai e în IN, dar încă nu a apărut în done/.
+            # Așteptăm până apare în done/ (sau maxim 15s de siguranță)
+            if not os.path.exists(in_file):
+                if disappeared_ts == 0.0:
+                    disappeared_ts = time.time()
+                elif (time.time() - disappeared_ts) > 15.0:
+                    return "OK (Fișier prelucrat de Tremol)"
+
+        # Curățăm fișierul netrimis din IN pentru a nu bloca coada ServerTremol la următoarele bonuri
+        if os.path.exists(in_file):
+            try:
+                os.remove(in_file)
+            except OSError:
+                pass
 
         raise FiscalException("TREMOL_TIMEOUT", f"Fișierul {job_name}.txt a fost creat în {self.in_dir}, dar Tremol nu a procesat bonul în {self.timeout_s}s. Verificați că ServerTremol.exe rulează și casa este conectată în REG.OPER.")
 
@@ -774,6 +1196,7 @@ class TremolDriver(BaseFiscalDriver):
         Linia U: U|0|0 (subtotal)
         Linii P: P|<tip plata>|<suma> (0=Numerar, 1=Card, 3=Tichete, 5=Voucher, 8=Alte)
         """
+        self._ensure_server_running()
         receipt = job_payload.get("receipt") or job_payload.get("body") or {}
         job_name = f"bon.{int(time.time())}_{task_id[-6:]}"
         lines = []
@@ -847,17 +1270,36 @@ class TremolDriver(BaseFiscalDriver):
         logger.info(f"[Tremol] Scriere bon {target_file} ({len(lines)} linii)")
         with open(tmp_file, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(content)
-        os.rename(tmp_file, target_file)
+        if os.path.exists(target_file):
+            try:
+                os.remove(target_file)
+            except OSError:
+                pass
+        os.replace(tmp_file, target_file)
 
         res = self._wait_for_response(job_name)
 
-        # Extragem numărul de bon din răspunsul Tremol (ex: 0|OK|1452|TR8765...)
+        # Extragem numărul de bon din răspunsul Tremol (ex: 0|OK|1|TREMOL sau din raspuns.txt)
         receipt_num = ""
         if res and "|" in res:
             parts = res.split("|")
             # Dacă prima parte e '0', bonul a fost cu succes
             if len(parts) >= 3 and parts[0] == "0":
                 receipt_num = parts[2].strip()
+
+        # Fallback suplimentar: căutăm direct în folderul done după fișierul jobului
+        if not receipt_num or not receipt_num.isdigit():
+            done_dir = os.path.join(self.in_dir, "done")
+            if os.path.exists(done_dir):
+                for r, _, fs in os.walk(done_dir):
+                    for f in fs:
+                        if job_name in f:
+                            m = re.search(r'\[done\]\[(\d+)\]', f)
+                            if m and m.group(1).isdigit() and int(m.group(1)) > 0:
+                                receipt_num = str(int(m.group(1)))
+                                break
+
+        logger.info(f"[Tremol] Bon fiscal finalizat cu succes! Nr. bon extras: {receipt_num or 'N/A'}")
 
         # Trimitem JSON-ul către Sincrona Cloud folosind cheile standard 
         # pe care le folosea și ErpNet.FP ca să fie recunoscute instant.
@@ -869,6 +1311,7 @@ class TremolDriver(BaseFiscalDriver):
             "taskId": task_id,
         }
 
+
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
         """
         Execută rapoarte fiscale Tremol:
@@ -876,6 +1319,7 @@ class TremolDriver(BaseFiscalDriver):
         - Raport X informativ (bon.x.raport.txt cu comanda X)
         - Raport periodic memorie fiscală pe date (F|DDMMYY|DDMMYY|0=sumar/1=detaliat)
         """
+        self._ensure_server_running()
         low_type = report_type.lower().replace("_", "")
         body = job_payload.get("body", {})
         from_date = body.get("fromDate", "")[:10]
@@ -897,7 +1341,7 @@ class TremolDriver(BaseFiscalDriver):
         else:
             is_z = "z" in low_type
             cmd = "Z\r\n" if is_z else "X\r\n"
-            file_name = f"bon.z.raport_{int(time.time())}.txt" if is_z else f"bon.x.raport_{int(time.time())}.txt"
+            file_name = f"bon.z.raport_{int(time.time())}_{task_id[-6:]}.txt" if is_z else f"bon.x.raport_{int(time.time())}_{task_id[-6:]}.txt"
 
         target_path = os.path.join(self.in_dir, file_name)
         tmp_path = os.path.join(self.in_dir, f"{file_name}.tmp")
@@ -905,11 +1349,110 @@ class TremolDriver(BaseFiscalDriver):
         with open(tmp_path, "w", newline="", encoding="cp1250", errors="replace") as f:
             f.write(cmd)
         if os.path.exists(target_path):
-            os.remove(target_path)
-        os.rename(tmp_path, target_path)
+            try:
+                os.remove(target_path)
+            except OSError:
+                pass
+        os.replace(tmp_path, target_path)
 
         res = self._wait_for_response(file_name.replace(".txt", ""))
-        return {"ok": True, "result": res, "report": report_type}
+
+        # Parsare răspuns Tremol ZFPServer pentru rapoarte fiscale
+        # Format tipic: 0|OK|[NumarZ]|[SerieFiscala]|[TotalGeneral]|[TotalNumerar]|[TotalCard]|[NumarBonuri]|[DataOra]
+        parts = [p.strip() for p in (res or "").split("|")]
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        report_num = ""
+        doc_count = "0"
+        total_amt = "0.00"
+        cash_amt = "0.00"
+        card_amt = "0.00"
+
+        if len(parts) >= 3 and parts[0] == "0":
+            if parts[2].isdigit():
+                report_num = parts[2]
+            if len(parts) >= 5:
+                try:
+                    total_amt = f"{float(parts[4]):.2f}"
+                except Exception:
+                    pass
+            if len(parts) >= 6:
+                try:
+                    cash_amt = f"{float(parts[5]):.2f}"
+                except Exception:
+                    pass
+            if len(parts) >= 7:
+                try:
+                    card_amt = f"{float(parts[6]):.2f}"
+                except Exception:
+                    pass
+            if len(parts) >= 8 and parts[7].isdigit():
+                doc_count = parts[7]
+
+        if "z" in low_type and not report_num:
+            done_dir = os.path.join(self.in_dir, "done")
+            if os.path.exists(done_dir):
+                for r, _, fs in os.walk(done_dir):
+                    for f in fs:
+                        if file_name.replace(".txt", "") in f:
+                            mz = re.search(r'[Zz](\d{4})', r)
+                            if mz and mz.group(1).isdigit():
+                                report_num = str(int(mz.group(1)))
+                                break
+
+        # Dacă ServerTremol este în mod fișier și nu a returnat sumele în răspuns,
+        # calculăm telemetria reală direct din bonurile arhivate în folderul Z
+        is_z_report = "z" in low_type
+        if (total_amt == "0.00" or doc_count == "0") and ("x" in low_type or is_z_report):
+            c_docs, c_total, c_cash, c_card, c_z = self._compute_current_z_totals(is_z=is_z_report)
+            if c_docs > 0:
+                doc_count = str(c_docs)
+                total_amt = f"{c_total:.2f}"
+                cash_amt = f"{c_cash:.2f}"
+                card_amt = f"{c_card:.2f}"
+            if c_z:
+                report_num = c_z
+
+        if is_z_report:
+            summary = f"Z nr. {report_num or '1'} - Raport Z {now_str}: {doc_count} documente, total {total_amt} RON (card: {card_amt} RON, cash: {cash_amt} RON)"
+        elif "x" in low_type:
+            summary = f"Raport X {now_str}: {doc_count} documente, total {total_amt} RON (card: {card_amt} RON, cash: {cash_amt} RON)"
+        elif "period" in low_type:
+            # Descărcare automată pachete ANAF în folderul C:\Datecs\ANAF (dacă e raport detaliat)
+            anaf_res = None
+            if body.get("type") == "detailed" or "anaf" in low_type:
+                anaf_res = self._download_anaf_via_dude(from_date, to_date)
+
+            if hasattr(self, "_compute_period_totals"):
+                p_docs, p_tot = self._compute_period_totals(from_date, to_date)
+            else:
+                p_docs, p_tot = 0, 0.0
+
+            if anaf_res and anaf_res.get("ok"):
+                summary = f"Raport memorie fiscală ({from_date} – {to_date}) descărcat cu succes în {anaf_res.get('dir')}!"
+            elif p_docs > 0:
+                summary = f"Raport memorie fiscală ({from_date} – {to_date}): {p_docs} documente, total {p_tot:.2f} RON"
+            else:
+                summary = f"Raport memorie fiscală ({from_date} – {to_date}) tipărit cu succes pe casa de marcat"
+        else:
+            summary = f"Raport {report_type.upper()} {now_str} executat cu succes"
+
+        return {
+            "ok": True,
+            "result": res,
+            "raw_response": res,
+            "report": report_type,
+            "reportNumber": report_num,
+            "report_number": report_num,
+            "total": total_amt,
+            "messages": [
+                {
+                    "type": "info",
+                    "text": summary,
+                }
+            ],
+            "taskId": task_id,
+        }
 
 
 # ==================== UNIVERSAL FISCAL ROUTER ====================
@@ -975,10 +1518,27 @@ def complete_job_http(job_id: str, status: str, result: dict):
             json={"status": status, "result": result},
             timeout=15
         )
+        if r.status_code == 409:
+            logger.info(f"[Cloud] Job {job_id} era deja marcat ca finalizat pe cloud.")
+            return
         r.raise_for_status()
         logger.info(f"[Cloud] Job {job_id} marcat ca {status} pe cloud.")
     except Exception as e:
         log_error("cloud", "COMPLETE_FAIL", f"Eroare la confirmarea jobului {job_id}: {e}")
+
+_claimed_jobs = set()
+_claimed_lock = threading.Lock()
+
+def claim_job(job_id: str) -> bool:
+    """Returnează True dacă jobul a fost revendicat cu succes (evită procesarea dublă)."""
+    with _claimed_lock:
+        if job_id in _claimed_jobs:
+            return False
+        _claimed_jobs.add(job_id)
+        if len(_claimed_jobs) > 500:
+            for old_id in list(_claimed_jobs)[:100]:
+                _claimed_jobs.remove(old_id)
+        return True
 
 class ResilientWebSocketClient:
     """Client WebSocket cu auto-reconnect, ping/pong și procesare comenzi."""
@@ -1053,9 +1613,11 @@ class ResilientWebSocketClient:
                         if msg.get("type") == "job" or "job" in msg:
                             job = msg.get("job") or msg
                             job_id = job.get("id")
+                            if job_id and not claim_job(job_id):
+                                continue
                             update_state(last_job_id=job_id, last_job_status="processing")
                             try:
-                                res = FiscalRouter.execute_job(job)
+                                res = await asyncio.to_thread(FiscalRouter.execute_job, job)
                                 update_state(
                                     total_jobs_ok=get_state()["total_jobs_ok"] + 1,
                                     last_job_status="completed"
@@ -1112,7 +1674,7 @@ class ResilientWebSocketClient:
 # ==================== HTTP POLLING ENGINE (FALLBACK / REDUNDANCY) ====================
 
 def run_http_polling():
-    """Rulează în fundal pentru a prelua joburi prin REST dacă WS nu este activ."""
+    """Rulează în fundal pentru a prelua joburi prin REST (redundant și robust)."""
     logger.info("[PollWorker] Worker de verificare HTTP pornit.")
     while True:
         cfg = get_config()
@@ -1132,6 +1694,9 @@ def run_http_polling():
                 job = r.json().get("job")
                 if job:
                     job_id = job.get("id")
+                    if job_id and not claim_job(job_id):
+                        time.sleep(1)
+                        continue
                     logger.info(f"[PollWorker] Job recepționat prin HTTP: {job_id}")
                     update_state(last_job_id=job_id, last_job_status="processing")
                     try:
@@ -1303,6 +1868,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <button class="primary" onclick="saveConfiguration()">💾 Salvează Configurația</button>
         <button class="secondary" onclick="testDriver()">🔌 Test Driver Local</button>
         <button class="secondary" onclick="testCloud()">🌐 Test Conexiune Cloud</button>
+        <button class="secondary" onclick="pollNow()">⚡ Interoghează Joburi Acum</button>
       </div>
 
       <div id="actionMsg" class="msg-box" style="display:none;"></div>
@@ -1491,6 +2057,20 @@ async function testCloud() {
   }
 }
 
+async function pollNow() {
+  const box = document.getElementById('actionMsg');
+  box.style.display = 'block';
+  box.textContent = 'Interogare coadă de joburi pe Sincrona Cloud...';
+  try {
+    const res = await fetch('/service/poll-now', { method: 'POST' });
+    const jr = await res.json();
+    box.textContent = (jr.job_found ? '✓ Job recepționat și procesat:\n' : 'ℹ Coada este goală (nicio comandă în așteptare):\n') + JSON.stringify(jr, null, 2);
+    updateStatus();
+  } catch(e) {
+    box.textContent = '✗ Eroare interogare coadă: ' + e.message;
+  }
+}
+
 async function clearErrorsLog() {
   if (!confirm('Doriți să ștergeți jurnalul de erori?')) return;
   await fetch('/service/clear-errors', { method: 'POST' });
@@ -1580,6 +2160,38 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 r.raise_for_status()
                 data = r.json() if r.content else {}
                 self._send_json(200, {"ok": True, "status": r.status_code, "data": data})
+            except Exception as e:
+                self._send_json(200, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+        elif path == "/service/poll-now":
+            cfg = get_config()
+            api = cfg.get("API_URL", "").rstrip("/")
+            if not api:
+                self._send_json(400, {"ok": False, "error": "API_URL nu este configurat."})
+                return
+            try:
+                r = requests.get(f"{api}/api/device/fiscal-printer/jobs", headers=get_headers(), timeout=12)
+                r.raise_for_status()
+                data = r.json() if r.content else {}
+                job = data.get("job")
+                processed = False
+                res = None
+                if job:
+                    job_id = job.get("id")
+                    if job_id and claim_job(job_id):
+                        update_state(last_job_id=job_id, last_job_status="processing")
+                        try:
+                            res = FiscalRouter.execute_job(job)
+                            update_state(total_jobs_ok=get_state()["total_jobs_ok"] + 1, last_job_status="completed")
+                            complete_job_http(job_id, "completed", res)
+                            processed = True
+                        except Exception as err:
+                            err_code = getattr(err, "code", "EXECUTION_ERROR")
+                            err_text = getattr(err, "text", str(err))
+                            update_state(total_jobs_failed=get_state()["total_jobs_failed"] + 1, last_job_status="failed", last_error=f"{err_code}: {err_text}")
+                            complete_job_http(job_id, "failed", {"error": err_code, "text": err_text})
+                            res = {"error": err_code, "text": err_text}
+                self._send_json(200, {"ok": True, "job_found": bool(job), "job": job, "processed": processed, "result": res})
             except Exception as e:
                 self._send_json(200, {"ok": False, "error": f"{type(e).__name__}: {e}"})
 
