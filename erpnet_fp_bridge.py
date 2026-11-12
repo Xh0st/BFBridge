@@ -22,6 +22,7 @@ import socket
 import subprocess
 import sys
 import threading
+from collections import OrderedDict
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -731,7 +732,7 @@ class DatecsDriver(BaseFiscalDriver):
         }
 
     def _download_anaf_via_dude(self, from_date: str, to_date: str) -> dict:
-        """
+        r"""
         Descarcă automat fișierele lunare ANAF direct prin serverul COM DUDE
         fără a fi nevoie de deschiderea aplicației DudeFrontApplication.exe.
         Salvează fișierele în C:\Datecs\ANAF.
@@ -1485,6 +1486,12 @@ class FiscalRouter:
     def execute_job(cls, job: dict) -> dict:
         driver = cls.get_driver()
         task_id = job.get("idempotency_key") or job.get("id") or str(int(time.time()))
+        # „Reîncearcă” păstrează id-ul jobului: ErpNet.FP ține taskId-urile în memorie și ar răspunde E109 cu
+        # rezultatul (eșuat) al primei încercări. Fiecare reîncercare primește deci propriul taskId (max. 60 car.);
+        # dublarea bonului rămâne blocată de uniqueSaleNumber (pa-<id plată>) din jurnalul USN al driverului.
+        retry_at = re.sub(r"\D", "", str(job.get("retry_requested_at") or ""))[:14]
+        if retry_at:
+            task_id = f"{task_id}-r{retry_at}"[:60]
         kind = job.get("kind", "receipt").lower()
         payload = job.get("payload", {})
 
@@ -1526,19 +1533,53 @@ def complete_job_http(job_id: str, status: str, result: dict):
     except Exception as e:
         log_error("cloud", "COMPLETE_FAIL", f"Eroare la confirmarea jobului {job_id}: {e}")
 
-_claimed_jobs = set()
+# Evidența încercărilor procesate. Același job poate sosi de două ori pentru aceeași încercare (push WebSocket +
+# preluare HTTP): se tipărește o singură dată. „Reîncearcă” din Sincrona păstrează id-ul jobului, dar setează
+# retry_requested_at, deci cheia diferă și jobul se procesează din nou. Dacă jobul revine pentru o încercare deja
+# terminată (confirmarea către cloud a eșuat), nu se retipărește: se retrimite rezultatul salvat.
+_job_attempts = OrderedDict()   # cheie încercare -> {"state": processing|completed|failed, "result": ..., "at": ts}
 _claimed_lock = threading.Lock()
+_ATTEMPT_TTL_S = 6 * 3600
+_ATTEMPT_MAX = 1000
 
-def claim_job(job_id: str) -> bool:
-    """Returnează True dacă jobul a fost revendicat cu succes (evită procesarea dublă)."""
+
+def _attempt_key(job: dict) -> str:
+    return f"{job.get('id') or ''}|{job.get('retry_requested_at') or ''}"
+
+
+def claim_job(job: dict):
+    """(True, None) dacă încercarea e nouă și a fost revendicată; (False, înregistrare) dacă e deja în lucru
+    sau terminată. Cele mai vechi înregistrări (peste TTL sau peste limită) se elimină în ordinea sosirii."""
+    key = _attempt_key(job)
+    now_ts = time.time()
     with _claimed_lock:
-        if job_id in _claimed_jobs:
-            return False
-        _claimed_jobs.add(job_id)
-        if len(_claimed_jobs) > 500:
-            for old_id in list(_claimed_jobs)[:100]:
-                _claimed_jobs.remove(old_id)
+        while _job_attempts:
+            first_key, first = next(iter(_job_attempts.items()))
+            if len(_job_attempts) > _ATTEMPT_MAX or now_ts - first["at"] > _ATTEMPT_TTL_S:
+                if first["state"] == "processing" and now_ts - first["at"] <= _ATTEMPT_TTL_S:
+                    break
+                _job_attempts.pop(first_key)
+            else:
+                break
+        rec = _job_attempts.get(key)
+        if rec is not None:
+            return False, dict(rec)
+        _job_attempts[key] = {"state": "processing", "result": None, "at": now_ts}
+        return True, None
+
+
+def finish_job(job: dict, status: str, result: dict) -> None:
+    with _claimed_lock:
+        _job_attempts[_attempt_key(job)] = {"state": status, "result": result, "at": time.time()}
+
+
+def resend_finished(job: dict, rec: dict) -> bool:
+    """Încercare deja terminată care revine de la server: retrimite rezultatul, fără a retipări bonul."""
+    if rec and rec.get("state") in ("completed", "failed"):
+        logger.info(f"[Router] Job {job.get('id')} deja {rec['state']} pentru această încercare; retrimit confirmarea.")
+        complete_job_http(job.get("id"), rec["state"], rec.get("result") or {})
         return True
+    return False
 
 class ResilientWebSocketClient:
     """Client WebSocket cu auto-reconnect, ping/pong și procesare comenzi."""
@@ -1613,8 +1654,11 @@ class ResilientWebSocketClient:
                         if msg.get("type") == "job" or "job" in msg:
                             job = msg.get("job") or msg
                             job_id = job.get("id")
-                            if job_id and not claim_job(job_id):
-                                continue
+                            if job_id:
+                                claimed, rec = claim_job(job)
+                                if not claimed:
+                                    await asyncio.to_thread(resend_finished, job, rec)
+                                    continue
                             update_state(last_job_id=job_id, last_job_status="processing")
                             try:
                                 res = await asyncio.to_thread(FiscalRouter.execute_job, job)
@@ -1623,6 +1667,7 @@ class ResilientWebSocketClient:
                                     last_job_status="completed"
                                 )
                                 # Răspuns prin WS și redundanță HTTP
+                                finish_job(job, "completed", res)
                                 await ws.send(json.dumps({
                                     "type": "job_result",
                                     "job_id": job_id,
@@ -1640,6 +1685,7 @@ class ResilientWebSocketClient:
                                 )
                                 log_error("router", err_code, err_text, {"job_id": job_id})
                                 fail_payload = {"error": err_code, "text": err_text}
+                                finish_job(job, "failed", fail_payload)
                                 await ws.send(json.dumps({
                                     "type": "job_result",
                                     "job_id": job_id,
@@ -1694,13 +1740,17 @@ def run_http_polling():
                 job = r.json().get("job")
                 if job:
                     job_id = job.get("id")
-                    if job_id and not claim_job(job_id):
-                        time.sleep(1)
-                        continue
+                    if job_id:
+                        claimed, rec = claim_job(job)
+                        if not claimed:
+                            resend_finished(job, rec)
+                            time.sleep(1)
+                            continue
                     logger.info(f"[PollWorker] Job recepționat prin HTTP: {job_id}")
                     update_state(last_job_id=job_id, last_job_status="processing")
                     try:
                         res = FiscalRouter.execute_job(job)
+                        finish_job(job, "completed", res)
                         update_state(
                             total_jobs_ok=get_state()["total_jobs_ok"] + 1,
                             last_job_status="completed"
@@ -1709,6 +1759,7 @@ def run_http_polling():
                     except Exception as err:
                         err_code = getattr(err, "code", "EXECUTION_ERROR")
                         err_text = getattr(err, "text", str(err))
+                        finish_job(job, "failed", {"error": err_code, "text": err_text})
                         update_state(
                             total_jobs_failed=get_state()["total_jobs_failed"] + 1,
                             last_job_status="failed",
@@ -2178,16 +2229,22 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
                 res = None
                 if job:
                     job_id = job.get("id")
-                    if job_id and claim_job(job_id):
+                    claimed, rec = claim_job(job) if job_id else (False, None)
+                    if not claimed and rec:
+                        processed = resend_finished(job, rec)
+                        res = rec.get("result")
+                    if claimed:
                         update_state(last_job_id=job_id, last_job_status="processing")
                         try:
                             res = FiscalRouter.execute_job(job)
+                            finish_job(job, "completed", res)
                             update_state(total_jobs_ok=get_state()["total_jobs_ok"] + 1, last_job_status="completed")
                             complete_job_http(job_id, "completed", res)
                             processed = True
                         except Exception as err:
                             err_code = getattr(err, "code", "EXECUTION_ERROR")
                             err_text = getattr(err, "text", str(err))
+                            finish_job(job, "failed", {"error": err_code, "text": err_text})
                             update_state(total_jobs_failed=get_state()["total_jobs_failed"] + 1, last_job_status="failed", last_error=f"{err_code}: {err_text}")
                             complete_job_http(job_id, "failed", {"error": err_code, "text": err_text})
                             res = {"error": err_code, "text": err_text}
