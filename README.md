@@ -1,74 +1,126 @@
-# Punte locală ErpNet.FP (Sincrona)
+# Sincrona Universal Fiscal Bridge (BFBridge)
 
-Rulează pe stația fiscală, lângă ErpNet.FP (sau simulatorul compatibil).
+**Sincrona Universal Fiscal Bridge** este agentul local de comunicație (IoT Edge Agent) care leagă platforma Cloud [Sincrona](https://sincrona.ro) de casele de marcat fiscale din România.
 
-1. Pornește ErpNet.FP **sau** simulatorul: `python simulator.py` — ascultă pe `http://127.0.0.1:8001`
-   (același API ca ErpNet.FP: `POST /printers/{id}/receipt`, `GET /printers/taskinfo?id=`).
-2. În Sincrona → Setări → Casă de marcat (pentru filiala selectată): server local `http://127.0.0.1:8001`,
-   ID imprimantă, mod (test/live), maparea cote TVA → grupe fiscale. Generează tokenul de dispozitiv.
-3. Configurează puntea în `config.json` (lângă script) **sau** din panoul `http://127.0.0.1:8002`:
+Rulează pe calculatorul la care este conectată casa de marcat, funcționând ca serviciu Windows sau aplicație de fundal.
+
+---
+
+## 🚀 Caracteristici principale
+
+- **Multi-Driver Fiscal:**
+  - **Datecs DUDE / FPrinter:** Protocol nativ fișiere `.inp` cu watchdog pe folderul `OUT`, comenzi native fiscale (48, 49, 53, 56).
+  - **Tremol ZFPServer:** Protocol nativ `ServerTremol.exe` (fișiere `bon.*.txt` / `raspuns.txt`, codare Windows-1250 / CP1250).
+  - **ErpNet.FP:** REST API HTTP pe `http://127.0.0.1:8001` (driver universal).
+- **Descărcare & Export Automat Pachete ANAF (A4200 / XML / p7b):**
+  - **Datecs:** Extragere automată direct prin serverul COM ActiveX Datecs DUDE (`dude.CFD_DUDE`), fără a mai necesita deschiderea manuală a aplicației `DudeFrontApplication.exe`.
+  - **Tremol:** Declanșare automată prin comanda nativă `L|DDMMYY|DDMMYY|1` executată prin `ServerTremol.exe` / `ZekaFP`.
+  - **Planificare lunară automată:** Puntea verifică periodic și descarcă automat extrasele lunii precedente în primele zile ale fiecărei luni (`anaf_monthly_downloads.json`).
+  - **Preluare și atașare automată:** Componenta `AnafXmlWatcher` monitorizează folderele (`C:\Datecs\ANAF`, `C:\ServerTremol\ANAF`, `C:\ServerTremol\RapoarteTXT`, `done`) și transmite automat pachetele în Sincrona, atașându-le la Rapoartele Z corespunzătoare.
+- **Declanșare la cerere din Cloud și Local:**
+  - Direct din aplicația Sincrona: butonul **„Descarcă fișiere ANAF din casă”** din `https://sincrona.ro/invoices?tab=accounting`.
+  - Din Panoul Web Admin local (`http://127.0.0.1:8002/`).
+- **Conexiune Duală Rezilientă:**
+  - Conexiune în timp real prin **WebSocket securizat** (`wss://`).
+  - Fallback automat pe **HTTP Polling** la deconectare sau rețele instabile.
+- **Mod Offline (Fără Internet):**
+  - Profil fiscal salvat local (`offline_profile.json`).
+  - Permite vânzarea și emiterea bonurilor din Sincrona locală chiar și în cazul căderii conexiunii la internet (`http://127.0.0.1:8002/local/receipt`).
+  - Bonurile emise offline se stochează în `offline_fiscal_journal.json` și sunt sincronizate automat în Cloud la revenirea internetului.
+- **Idempotență și Siguranță (USN Journal):**
+  - Jurnal local USN (`file_usn_journal.json`): un bon retrimis cu același `uniqueSaleNumber` nu se va retipări pe casa de marcat, prevenind dublarea bonurilor fiscale.
+- **Panou de Control Web Local:**
+  - Accesibil pe `http://127.0.0.1:8002/` pentru diagnostic, testare driver, testare cloud, schimbare setări și declanșare manuală ANAF.
+
+---
+
+## 📦 Cerințe de sistem
+
+- Windows 10 sau Windows 11 (32-bit sau 64-bit).
+- Python 3.10+ (sau executabilul de sine stătător compilat).
+- Pentru **Datecs**: Aplicația Datecs DUDE instalată (pentru înregistrarea ActiveX COM `dude.CFD_DUDE` și directoarele `C:\Datecs\In`, `C:\Datecs\Out`, `C:\Datecs\ANAF`).
+- Pentru **Tremol**: `ServerTremol.exe` configurat în `C:\ServerTremol` pe portul serial respectiv (ex: `COM9`, `115200`).
+
+---
+
+## ⚙️ Configurare rapidă
+
+Fișierul de configurare `config.json` se generează automat la prima pornire sau se configurează direct din panoul web `http://127.0.0.1:8002/`:
 
 ```json
-{ "API_URL": "https://api.sincrona.ro", "DEVICE_TOKEN": "fp_..." }
+{
+  "API_URL": "https://api.sincrona.ro",
+  "WS_URL": "",
+  "DEVICE_TOKEN": "fp_xxxxxx...",
+  "FISCAL_DRIVER": "datecs",
+  "DATECS_IN_DIR": "C:\\Datecs\\In",
+  "DATECS_OUT_DIR": "C:\\Datecs\\Out",
+  "DATECS_FORMAT": "dude",
+  "DATECS_COM_PORT": 6,
+  "DATECS_BAUDRATE": 115200,
+  "DATECS_ANAF_DIR": "C:\\Datecs\\ANAF",
+  "ANAF_AUTO_MONTHLY_DOWNLOAD": true,
+  "TREMOL_IN_DIR": "C:\\ServerTremol\\Bonuri",
+  "TREMOL_OUT_DIR": "C:\\ServerTremol",
+  "ANAF_XML_DIRS": [
+    "C:\\Datecs\\ANAF",
+    "C:\\ServerTremol\\ANAF"
+  ],
+  "TIMEOUT_SECONDS": 45
+}
 ```
 
-   Alternativ, variabile de mediu: `SINCRONA_API_URL`, `FP_DEVICE_TOKEN`.
-4. Pornește: `python erpnet_fp_bridge.py`.
+> **Important (Securitate):** Nu urcați niciodată `config.json` sau jurnalele locale pe GitHub! Acestea sunt deja incluse în `.gitignore`.
 
-Puntea preia doar joburile filialei/imprimantei asociate tokenului. La refuz, codul și mesajul casei
-(ex. `PAPER_OUT`) sunt trimise înapoi în Sincrona și apar la bonul în așteptare.
+---
 
-**Securitate:** tokenul nu este scris în cod. Nu urca `config.json` și fișierele `*.jsonl` / `*.log`
-pe GitHub (sunt în `.gitignore`). Dacă un token a ajuns în cod sau în git, revocă-l din Sincrona și generează altul.
+## 🛠️ Rulare & Dezvoltare
 
-## Rapoarte casă de marcat
+### 1. Instalare dependențe
+```bash
+pip install -r requirements.txt
+```
 
-Din Sincrona → Casă → „Rapoarte casă de marcat”: **Raport X** (informativ), **Raport Z** (închidere zilnică,
-obligatoriu) și **Raport lunar memorie fiscală** (`periodreport`, scurt). Puntea apelează
-`POST /printers/{id}/xreport | zreport | periodreport` din ErpNet.FP; simulatorul le suportă și el.
-Tipul plății pe bon: numerar → `cash`, POS/card → `card`, transfer → `bank` (câmpul `payments[].paymentType`).
+### 2. Pornire manuală
+```bash
+python erpnet_fp_bridge.py
+```
+Panoul Web de diagnostic va fi disponibil la: **`http://127.0.0.1:8002/`**.
 
-## Idempotență (bon tipărit o singură dată)
+### 3. Simulator fiscal (pentru testare fără casă fizică)
+```bash
+python simulator.py
+```
+Simulatorul emulează o casă de marcat pe `http://127.0.0.1:8001` și generează rapoarte Z și XML-uri de test în folderul `anaf_xml/`.
 
-- Fiecare bon are `taskId` = `uniqueSaleNumber` = `pa-<id încasare>`.
-- Dacă ErpNet.FP întoarce `E109` (taskId deja folosit) la o reîncercare, puntea nu retrimite bonul, ci citește
-  rezultatul taskului inițial.
-- Driverul românesc (fork ErpNet.FP v1.1.0-ro) ține jurnalul `usn-journal`: un bon retrimis cu același
-  `uniqueSaleNumber` nu se mai tipărește (întoarce rezultatul salvat). `E409` = bon întrerupt, posibil tipărit —
-  verificați ultimul bon pe casă.
-- Puntea așteaptă confirmarea casei 80 s (170 s la raportul de memorie fiscală); la depășire raportează
-  `TASK_TIMEOUT`, iar „Reîncearcă” din Sincrona este sigur.
+---
 
-## Fișiere XML ANAF ale rapoartelor Z (preluare automată)
+## 🧾 Fluxul Rapoartelor Lunare ANAF (A4200)
 
-Casa de marcat generează, la fiecare raport Z, fișierul XML cerut de OPANAF 146/2018 (semnat de aparat).
-Puntea nu îl citește direct din aparat: îl preia din folderul în care îl salvează programul producătorului.
+1. **Automat:** La fiecare început de lună, puntea calculează intervalul lunii calendaristice precedente și declanșează descărcarea (Datecs via COM ActiveX, Tremol via fișier de comandă `L`).
+2. **Manual din Sincrona Cloud:** În `Facturi › Contabilitate › Export SAGA & Rapoarte Z` (`https://sincrona.ro/invoices?tab=accounting`), apăsați butonul **„Descarcă fișiere ANAF din casă”**.
+3. **Manual din Puntea Locală:** Pe `http://127.0.0.1:8002/`, selectați datele dorite și apăsați **„⚡ Descarcă Pachete ANAF Acum”**.
+4. Fișierele sunt preluate automat de `AnafXmlWatcher` și trimise securizat către Sincrona, fiind atașate automat la Rapoartele Z corespunzătoare.
 
-1. Exportați fișierele ANAF din programul producătorului într-un folder fix, de exemplu:
-   - Datecs: DUDE (*Datecs Applications\DUDE*), funcția de citire / export a fișierelor ANAF (XML) din casa de marcat → `C:\Datecs\ANAF`;
-   - Tremol: utilitarul Tremol pentru fișierele ANAF / jurnalul electronic → de ex. `C:\ServerTremol\ANAF`.
-2. În panoul punții (http://127.0.0.1:8002) → „Fișiere XML ANAF” → „Foldere urmărite”, treceți folderul (câte unul pe rând) și salvați.
-   (În `config.json`: `"ANAF_XML_DIRS": ["C:\\Datecs\\ANAF"]`.)
-3. La fiecare minut puntea trimite fișierele noi (`.xml`, `.p7m`, `.p7s`, `.zip`); Sincrona le potrivește după NUI, numărul Z
-   și dată și le atașează la Raportul Z al filialei. Dacă Raportul Z nu e încă în Sincrona, puntea reîncearcă la 10 minute.
-   Evidența fișierelor trimise: `anaf_xml_sent.json`.
+---
 
-Simulator: la fiecare raport Z scrie un XML de TEST (nesemnat) în `anaf_xml\` lângă simulator
-(`"simulator": {"anaf_xml_dir": "..."}` în config.json; gol = dezactivat). Treceți acel folder la „Foldere urmărite”.
+## 📦 Compilare & Creare Instalator Windows
 
-Manual: Facturi › Contabilitate › Rapoarte Z › „Import fișiere ANAF (XML / ZIP)” — se pot selecta mai multe fișiere sau o arhivă.
+După testarea pe casele de marcat fizice, noul installer Windows poate fi generat cu scriptul inclus:
 
-## Fără internet (mod offline)
+```bash
+# 1. Compilare executabil
+python build.py
 
-Cât e internet, puntea descarcă din Sincrona setările casei (imprimanta, mod test/live, cotele TVA → grupe fiscale)
-în `offline_profile.json`. Fără internet, aplicația Sincrona deschisă **pe acest calculator** (pagina „Sincronizare”)
-trimite bonul fiscal sau raportul X / Z direct la punte (`http://127.0.0.1:8002/local/*`), care îl tipărește pe casă,
-îl notează în `offline_records.json` și îl trimite singură în Sincrona când revine internetul
-(`POST /api/device/fiscal-printer/offline-records`). Același bon cerut de două ori nu se tipărește a doua oară.
+# sau folosind batch-ul automat:
+build.bat
 
-- Doar paginile `https://*.sincrona.ro` (și `localhost` pentru dezvoltare) pot trimite bonuri la punte; setările punții
-  (`/service/*`) se schimbă doar din panoul ei. Panoul ascultă doar pe `127.0.0.1` (`"ADMIN_BIND": "0.0.0.0"` în
-  `config.json` pentru acces din rețea).
-- Bonurile emise offline apar în Sincrona pe pagina „Sincronizare” și trebuie trecute la încasări cu numărul bonului;
-  raportul Z offline se înregistrează automat la Rapoartele Z.
-- `offline_profile.json` și `offline_records.json` nu se urcă pe GitHub.
+# 2. Generare installer Inno Setup
+# Se compilează scriptul SincronaSetup.iss cu Inno Setup Compiler
+```
+
+---
+
+## 📄 Licență
+Proprietar: **Sincrona Enterprise IoT**  
+Toate drepturile rezervate.
