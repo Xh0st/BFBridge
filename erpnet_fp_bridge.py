@@ -27,7 +27,7 @@ import threading
 from collections import OrderedDict
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -122,6 +122,15 @@ def clear_errors():
         pass
 
 
+def get_previous_month_range() -> tuple[str, str]:
+    """Returnează (from_date, to_date) în format YYYY-MM-DD pentru luna calendaristică precedentă."""
+    now_dt = datetime.now()
+    first_cur = now_dt.replace(day=1)
+    last_prev = first_cur - timedelta(days=1)
+    first_prev = last_prev.replace(day=1)
+    return first_prev.strftime("%Y-%m-%d"), last_prev.strftime("%Y-%m-%d")
+
+
 # ==================== CONFIGURATION MANAGER ====================
 
 DEFAULT_CONFIG = {
@@ -133,6 +142,10 @@ DEFAULT_CONFIG = {
     "DATECS_IN_DIR": r"C:\Datecs\In",
     "DATECS_OUT_DIR": r"C:\Datecs\Out",
     "DATECS_FORMAT": "dude",     # 'dude' sau 'fprinter'
+    "DATECS_COM_PORT": 6,
+    "DATECS_BAUDRATE": 115200,
+    "DATECS_ANAF_DIR": r"C:\Datecs\ANAF",
+    "ANAF_AUTO_MONTHLY_DOWNLOAD": True,
     "TREMOL_IN_DIR": r"C:\ServerTremol\Bonuri",
     "TREMOL_OUT_DIR": r"C:\ServerTremol",
     "POLL_FALLBACK": True,
@@ -762,6 +775,62 @@ class DatecsDriver(BaseFiscalDriver):
         except OSError:
             pass
         return result
+
+    def _download_anaf_via_dude(self, from_date: str = "", to_date: str = "") -> dict:
+        r"""
+        Descarcă automat pachetele lunare ANAF (.p7b / .xml) direct prin serverul COM Datecs DUDE (dude.CFD_DUDE)
+        fără a fi nevoie de deschiderea manuală a aplicației DudeFrontApplication.exe.
+        Salvează fișierele în folderul configurat (implicit C:\Datecs\ANAF).
+        """
+        if not from_date or not to_date:
+            from_date, to_date = get_previous_month_range()
+
+        try:
+            import win32com.client
+            cfg = get_config()
+            com_port = int(cfg.get("DATECS_COM_PORT", 6))
+            baud_rate = int(cfg.get("DATECS_BAUDRATE", 115200))
+            anaf_dir = cfg.get("DATECS_ANAF_DIR", r"C:\Datecs\ANAF")
+            os.makedirs(anaf_dir, exist_ok=True)
+
+            logger.info(f"[ANAF DUDE] Inițializare server COM CFD_DUDE pentru descărcare automată ({from_date} -> {to_date})...")
+            dude_obj = win32com.client.Dispatch("dude.CFD_DUDE")
+
+            # Conversie format dată în DD-MM-YY HH:mm:ss
+            def _to_dude_dt(d_str: str, is_end: bool) -> str:
+                parts = d_str.strip().split("-")
+                time_suffix = "23:59:59" if is_end else "00:00:00"
+                if len(parts) == 3 and len(parts[0]) == 4:
+                    return f"{parts[2]}-{parts[1]}-{parts[0][2:]} {time_suffix}"
+                return f"{d_str} {time_suffix}"
+
+            start_dt = _to_dude_dt(from_date, False)
+            end_dt = _to_dude_dt(to_date, True)
+
+            dude_obj.set_TransportType(0)  # 0 = RS232 / COM
+            dude_obj.set_RS232(com_port, baud_rate)
+            err = dude_obj.open_Connection()
+            if err != 0:
+                err_msg = getattr(dude_obj, "lastError_Message", "") or f"cod eroare {err}"
+                logger.warning(f"[ANAF DUDE] Nu s-a putut deschide portul COM{com_port} prin DUDE COM: {err_msg}")
+                return {"ok": False, "error": f"Eroare port COM{com_port}: {err_msg}"}
+
+            try:
+                dude_obj.set_Download_Path(anaf_dir)
+                dude_obj.DateRange_StartValue = start_dt
+                dude_obj.DateRange_EndValue = end_dt
+                logger.info(f"[ANAF DUDE] Declanșare descărcare pachete ANAF în: {anaf_dir} ({start_dt} – {end_dt})...")
+                res_code = dude_obj.download_ANAF_DTRange()
+                logger.info(f"[ANAF DUDE] Finalizat descărcare ANAF cu cod: {res_code}")
+                return {"ok": True, "code": res_code, "dir": anaf_dir, "from_date": from_date, "to_date": to_date}
+            finally:
+                try:
+                    dude_obj.close_Connection()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"[ANAF DUDE] Excepție apel COM CFD_DUDE: {e}")
+            return {"ok": False, "error": str(e)}
 
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
         self._ensure_server_running()
@@ -1598,6 +1667,22 @@ class FiscalRouter:
         return driver.print_receipt(payload, task_id)
 
 
+def trigger_anaf_download(from_date: str = "", to_date: str = "") -> dict:
+    """Declanșează descărcarea automată a rapoartelor ANAF prin DUDE COM (Datecs)."""
+    driver = FiscalRouter.get_driver()
+    if hasattr(driver, "_download_anaf_via_dude"):
+        return driver._download_anaf_via_dude(from_date, to_date)
+    # Fallback dacă driverul setat e erpnet/tremol dar avem Datecs instalat
+    cfg = get_config()
+    d = DatecsDriver(
+        in_dir=cfg.get("DATECS_IN_DIR", r"C:\Datecs\In"),
+        out_dir=cfg.get("DATECS_OUT_DIR", r"C:\Datecs\Out"),
+        format_mode=cfg.get("DATECS_FORMAT", "dude"),
+        timeout_s=cfg.get("TIMEOUT_SECONDS", 45),
+    )
+    return d._download_anaf_via_dude(from_date, to_date)
+
+
 # ==================== CLOUD API & WEBSOCKET ENGINE ====================
 
 def get_headers():
@@ -2182,6 +2267,22 @@ ADMIN_HTML = r"""<!DOCTYPE html>
           <label for="datecsOut">Director OUT Datecs (Watchdog)</label>
           <input id="datecsOut" placeholder="C:\Datecs\Out">
         </div>
+        <div class="field">
+          <label for="datecsComPort">Port COM Datecs (pentru extragere automată ANAF)</label>
+          <input id="datecsComPort" type="number" placeholder="6">
+        </div>
+        <div class="field">
+          <label for="datecsBaudRate">Baudrate Port COM</label>
+          <input id="datecsBaudRate" type="number" placeholder="115200">
+        </div>
+        <div class="field">
+          <label for="datecsAnafDir">Folder Pachete ANAF (.p7b / .xml)</label>
+          <input id="datecsAnafDir" placeholder="C:\Datecs\ANAF">
+        </div>
+        <div class="field" style="display:flex;align-items:center;gap:8px;margin-top:10px;">
+          <input id="anafAutoDownload" type="checkbox" style="width:auto;margin:0;">
+          <label for="anafAutoDownload" style="margin:0;font-weight:normal;">Descărcare automată lunară a pachetelor ANAF prin DUDE COM la începutul fiecărei luni</label>
+        </div>
       </div>
 
       <!-- Câmpuri specifice Tremol -->
@@ -2201,6 +2302,24 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         <label for="anafDirs">Foldere urmărite (câte unul pe rând)</label>
         <textarea id="anafDirs" rows="3" style="width:100%;font-family:monospace" placeholder="C:\Datecs\ANAF&#10;C:\ServerTremol\ANAF"></textarea>
         <small>Folderele în care DUDE, utilitarul Tremol sau simulatorul salvează fișierele XML ale rapoartelor Z. Puntea le trimite automat în Sincrona și le atașează la Raportul Z (Facturi › Contabilitate › Rapoarte Z).</small>
+      </div>
+
+      <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:6px;margin-top:12px;border:1px solid var(--border);">
+        <strong style="display:block;margin-bottom:8px;font-size:0.95rem;">📥 Extragere Manuală Pachete ANAF (Datecs DUDE COM)</strong>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+          <div>
+            <label for="anafFromDate" style="font-size:0.8rem;display:block;margin-bottom:4px;">De la data</label>
+            <input id="anafFromDate" type="date" style="width:100%;">
+          </div>
+          <div>
+            <label for="anafToDate" style="font-size:0.8rem;display:block;margin-bottom:4px;">Până la data</label>
+            <input id="anafToDate" type="date" style="width:100%;">
+          </div>
+        </div>
+        <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="secondary" style="padding:6px 12px;font-size:0.8rem;" type="button" onclick="setPrevMonthDates()">📅 Selectează Luna Trecută</button>
+          <button class="primary" style="padding:6px 12px;font-size:0.8rem;" type="button" onclick="downloadAnafNow()">⚡ Descarcă Pachete ANAF Acum</button>
+        </div>
       </div>
 
       <h2 style="margin-top:24px;">☁️ Conexiune Cloud (Sincrona)</h2>
@@ -2292,11 +2411,16 @@ async function loadData() {
     document.getElementById('datecsFormat').value = c.DATECS_FORMAT || 'dude';
     document.getElementById('datecsIn').value = c.DATECS_IN_DIR || '';
     document.getElementById('datecsOut').value = c.DATECS_OUT_DIR || '';
+    document.getElementById('datecsComPort').value = c.DATECS_COM_PORT || 6;
+    document.getElementById('datecsBaudRate').value = c.DATECS_BAUDRATE || 115200;
+    document.getElementById('datecsAnafDir').value = c.DATECS_ANAF_DIR || 'C:\\Datecs\\ANAF';
+    document.getElementById('anafAutoDownload').checked = (c.ANAF_AUTO_MONTHLY_DOWNLOAD !== false);
     document.getElementById('tremolIn').value = c.TREMOL_IN_DIR || '';
     document.getElementById('tremolOut').value = c.TREMOL_OUT_DIR || '';
     document.getElementById('anafDirs').value = (Array.isArray(c.ANAF_XML_DIRS) ? c.ANAF_XML_DIRS : String(c.ANAF_XML_DIRS || '').split(';')).filter(Boolean).join('\n');
     document.getElementById('apiUrl').value = c.API_URL || '';
     document.getElementById('wsUrl').value = c.WS_URL || '';
+    setPrevMonthDates();
     toggleDriverFields();
   } catch(e) {}
 
@@ -2359,6 +2483,10 @@ async function saveConfiguration() {
     DATECS_FORMAT: document.getElementById('datecsFormat').value,
     DATECS_IN_DIR: document.getElementById('datecsIn').value.trim(),
     DATECS_OUT_DIR: document.getElementById('datecsOut').value.trim(),
+    DATECS_COM_PORT: parseInt(document.getElementById('datecsComPort').value) || 6,
+    DATECS_BAUDRATE: parseInt(document.getElementById('datecsBaudRate').value) || 115200,
+    DATECS_ANAF_DIR: document.getElementById('datecsAnafDir').value.trim() || 'C:\\Datecs\\ANAF',
+    ANAF_AUTO_MONTHLY_DOWNLOAD: document.getElementById('anafAutoDownload').checked,
     TREMOL_IN_DIR: document.getElementById('tremolIn').value.trim(),
     TREMOL_OUT_DIR: document.getElementById('tremolOut').value.trim(),
     ANAF_XML_DIRS: document.getElementById('anafDirs').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
@@ -2383,6 +2511,43 @@ async function saveConfiguration() {
     updateStatus();
   } catch(e) {
     box.textContent = '✗ Eroare la salvare: ' + e.message;
+  }
+}
+
+function setPrevMonthDates() {
+  const d = new Date();
+  const firstCur = new Date(d.getFullYear(), d.getMonth(), 1);
+  const lastPrev = new Date(firstCur.getTime() - 86400000);
+  const firstPrev = new Date(lastPrev.getFullYear(), lastPrev.getMonth(), 1);
+  const fmt = dt => {
+    const y = dt.getFullYear();
+    const m = String(dt.getMonth() + 1).padStart(2, '0');
+    const day = String(dt.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+  const elFrom = document.getElementById('anafFromDate');
+  const elTo = document.getElementById('anafToDate');
+  if (elFrom && !elFrom.value) elFrom.value = fmt(firstPrev);
+  if (elTo && !elTo.value) elTo.value = fmt(lastPrev);
+}
+
+async function downloadAnafNow() {
+  const from_date = (document.getElementById('anafFromDate').value || '').trim();
+  const to_date = (document.getElementById('anafToDate').value || '').trim();
+  const box = document.getElementById('actionMsg');
+  box.style.display = 'block';
+  box.textContent = `Descărcare pachete ANAF prin Datecs DUDE COM (${from_date} -> ${to_date}) în curs...`;
+  try {
+    const res = await fetch('/service/download-anaf', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ from_date, to_date })
+    });
+    const jr = await res.json();
+    box.textContent = (jr.ok ? '✓ Descărcare ANAF finalizată cu succes:\n' : '✗ Eroare descărcare ANAF:\n') + JSON.stringify(jr, null, 2);
+    updateStatus();
+  } catch(e) {
+    box.textContent = '✗ Eroare apel: ' + e.message;
   }
 }
 
@@ -2564,7 +2729,22 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        if path in ("/local/receipt", "/local/report"):
+        if path in ("/local/receipt", "/local/report", "/local/download-anaf"):
+            if path == "/local/download-anaf":
+                if not (LOCAL_ORIGIN_RE.match(self._origin()) or self._same_origin()):
+                    self._send_json(403, {"ok": False, "error": "Origine nepermisă"})
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(length) if length else b"{}"
+                data = {}
+                if raw:
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        pass
+                res = trigger_anaf_download(data.get("from_date", ""), data.get("to_date", ""))
+                self._send_json(200 if res.get("ok") else 500, res)
+                return
             self._local_post(path)
             return
         # setările punții se schimbă doar din panoul ei (un site străin nu poate redirecționa tokenul casei)
@@ -2572,7 +2752,21 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False, "error": "Origine nepermisă"})
             return
 
-        if path == "/service/config":
+        if path == "/service/download-anaf":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b"{}"
+            data = {}
+            if raw:
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    pass
+            from_date = data.get("from_date") or data.get("startDate") or ""
+            to_date = data.get("to_date") or data.get("endDate") or ""
+            res = trigger_anaf_download(from_date, to_date)
+            self._send_json(200 if res.get("ok") else 500, res)
+
+        elif path == "/service/config":
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length) if length else b"{}"
             try:
@@ -2698,7 +2892,58 @@ class AnafXmlWatcher:
         raw = get_config().get("ANAF_XML_DIRS") or []
         if isinstance(raw, str):
             raw = [p for p in re.split(r"[;\n]", raw) if p.strip()]
-        return [os.path.expandvars(os.path.expanduser(str(p).strip())) for p in raw if str(p).strip()]
+        result = [os.path.expandvars(os.path.expanduser(str(p).strip())) for p in raw if str(p).strip()]
+        # Fallback pe folderele standard dacă există pe disc și nu sunt adăugate deja
+        for fallback in (get_config().get("DATECS_ANAF_DIR", r"C:\Datecs\ANAF"), r"C:\Datecs\ANAF", r"C:\ServerTremol\ANAF"):
+            if os.path.isdir(fallback) and fallback not in result:
+                result.append(fallback)
+        return result
+
+    def check_auto_monthly_download(self):
+        """Verifică dacă a început o lună nouă și descarcă automat extrasele ANAF pentru luna precedentă."""
+        cfg = get_config()
+        if not cfg.get("ANAF_AUTO_MONTHLY_DOWNLOAD", True):
+            return
+
+        now_ts = time.time()
+        if hasattr(self, "_last_auto_check") and (now_ts - self._last_auto_check < 3600):
+            return
+        self._last_auto_check = now_ts
+
+        from_date, to_date = get_previous_month_range()
+        month_key = from_date[:7]
+        hist_path = os.path.join(BASE_DIR, "anaf_monthly_downloads.json")
+        history = {}
+        if os.path.isfile(hist_path):
+            try:
+                with open(hist_path, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = {}
+
+        last_entry = history.get(month_key)
+        if last_entry and last_entry.get("status") == "ok":
+            return
+
+        # Dacă a dat eroare recent, reîncercăm după 6 ore pentru a nu bloca portul COM
+        if last_entry and (now_ts - float(last_entry.get("ts", 0)) < 21600):
+            return
+
+        logger.info(f"[ANAF AUTO] Declanșare descărcare automată pachete ANAF pentru luna precedentă {month_key} ({from_date} -> {to_date})...")
+        res = trigger_anaf_download(from_date, to_date)
+        history[month_key] = {
+            "ts": now_ts,
+            "from_date": from_date,
+            "to_date": to_date,
+            "status": "ok" if res.get("ok") else "error",
+            "error": res.get("error") if not res.get("ok") else None,
+            "details": res
+        }
+        try:
+            with open(hist_path, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            logger.warning(f"[ANAF AUTO] Nu s-a putut salva istoricul descărcărilor ANAF: {e}")
 
     def candidates(self):
         max_age = float(get_config().get("ANAF_XML_MAX_AGE_DAYS", 45)) * 86400
@@ -2780,6 +3025,11 @@ class AnafXmlWatcher:
 
     def run(self):
         while True:
+            try:
+                self.check_auto_monthly_download()
+            except Exception as e:
+                logger.warning(f"[ANAF AUTO] Eroare verificare descărcare automată: {e}")
+
             try:
                 if self.dirs():
                     self.scan_once()
