@@ -1011,6 +1011,56 @@ class TremolDriver(BaseFiscalDriver):
         except Exception as e:
             logger.warning(f"[Tremol] Nu s-a putut verifica/porni ServerTremol: {e}")
 
+    def _download_anaf_via_tremol(self, from_date: str = "", to_date: str = "") -> dict:
+        r"""
+        Declanșează exportul automat al pachetelor lunare ANAF XML prin ServerTremol folosind comanda nativă L.
+        Format oficial Tremol (DocumentatieFormatServerTremol.txt):
+          L|<data inceput export xml>[DDMMYY]|<data sfasit export xml>[DDMMYY]|<salvare suport extern>[0=USB, 1=SD Card]
+        Fișier drop-in: C:\ServerTremol\Bonuri\bon.xml.raport_<timestamp>.txt
+        """
+        if not from_date or not to_date:
+            from_date, to_date = get_previous_month_range()
+
+        self._ensure_server_running()
+
+        def _to_tremol_dt(d_str: str) -> str:
+            parts = d_str.strip().split("-")
+            if len(parts) == 3 and len(parts[0]) == 4:
+                return f"{parts[2]}{parts[1]}{parts[0][2:]}"
+            return d_str
+
+        d_from = _to_tremol_dt(from_date)
+        d_to = _to_tremol_dt(to_date)
+        # 1 = salvare pe SD Card/memorie internă a casei de marcat
+        cmd = f"L|{d_from}|{d_to}|1\r\n"
+        file_base = f"bon.xml.raport_{int(time.time())}"
+        target_path = os.path.join(self.in_dir, f"{file_base}.txt")
+        tmp_path = os.path.join(self.in_dir, f"{file_base}.tmp")
+
+        logger.info(f"[ANAF Tremol] Trimitere comandă export XML ANAF ({from_date} -> {to_date}): {cmd.strip()} în {target_path}...")
+        try:
+            with open(tmp_path, "w", newline="", encoding="cp1250", errors="replace") as f:
+                f.write(cmd)
+            if os.path.exists(target_path):
+                try:
+                    os.remove(target_path)
+                except OSError:
+                    pass
+            os.replace(tmp_path, target_path)
+
+            res = self._wait_for_response(file_base)
+            logger.info(f"[ANAF Tremol] Răspuns ServerTremol export XML: {res}")
+            return {
+                "ok": True,
+                "result": res,
+                "driver": "tremol",
+                "from_date": from_date,
+                "to_date": to_date
+            }
+        except Exception as e:
+            logger.error(f"[ANAF Tremol] Eroare la trimiterea comenzii de export XML: {e}")
+            return {"ok": False, "error": str(e), "driver": "tremol"}
+
     def test_connection(self) -> dict:
         in_ok = os.path.isdir(self.in_dir) and os.access(self.in_dir, os.W_OK)
         out_ok = os.path.isdir(self.out_dir) and os.access(self.out_dir, os.R_OK)
@@ -1502,10 +1552,10 @@ class TremolDriver(BaseFiscalDriver):
         elif "x" in low_type:
             summary = f"Raport X {now_str}: {doc_count} documente, total {total_amt} RON (card: {card_amt} RON, cash: {cash_amt} RON)"
         elif "period" in low_type:
-            # Descărcare automată pachete ANAF în folderul C:\Datecs\ANAF (dacă e raport detaliat)
+            # Descărcare automată pachete ANAF prin ServerTremol (dacă e raport detaliat)
             anaf_res = None
             if body.get("type") == "detailed" or "anaf" in low_type:
-                anaf_res = self._download_anaf_via_dude(from_date, to_date)
+                anaf_res = self._download_anaf_via_tremol(from_date, to_date)
 
             if hasattr(self, "_compute_period_totals"):
                 p_docs, p_tot = self._compute_period_totals(from_date, to_date)
@@ -1513,7 +1563,7 @@ class TremolDriver(BaseFiscalDriver):
                 p_docs, p_tot = 0, 0.0
 
             if anaf_res and anaf_res.get("ok"):
-                summary = f"Raport memorie fiscală ({from_date} – {to_date}) descărcat cu succes în {anaf_res.get('dir')}!"
+                summary = f"Raport memorie fiscală ({from_date} – {to_date}) solicitat cu succes prin ServerTremol!"
             elif p_docs > 0:
                 summary = f"Raport memorie fiscală ({from_date} – {to_date}): {p_docs} documente, total {p_tot:.2f} RON"
             else:
@@ -1668,19 +1718,30 @@ class FiscalRouter:
 
 
 def trigger_anaf_download(from_date: str = "", to_date: str = "") -> dict:
-    """Declanșează descărcarea automată a rapoartelor ANAF prin DUDE COM (Datecs)."""
+    """Declanșează descărcarea/exportul automat al rapoartelor ANAF prin driverul fiscal activ (Datecs sau Tremol)."""
     driver = FiscalRouter.get_driver()
+    if hasattr(driver, "_download_anaf_via_tremol"):
+        return driver._download_anaf_via_tremol(from_date, to_date)
     if hasattr(driver, "_download_anaf_via_dude"):
         return driver._download_anaf_via_dude(from_date, to_date)
-    # Fallback dacă driverul setat e erpnet/tremol dar avem Datecs instalat
+
     cfg = get_config()
-    d = DatecsDriver(
-        in_dir=cfg.get("DATECS_IN_DIR", r"C:\Datecs\In"),
-        out_dir=cfg.get("DATECS_OUT_DIR", r"C:\Datecs\Out"),
-        format_mode=cfg.get("DATECS_FORMAT", "dude"),
-        timeout_s=cfg.get("TIMEOUT_SECONDS", 45),
-    )
-    return d._download_anaf_via_dude(from_date, to_date)
+    driver_name = (cfg.get("FISCAL_DRIVER") or "datecs").lower()
+    if driver_name == "tremol":
+        d = TremolDriver(
+            in_dir=cfg.get("TREMOL_IN_DIR", r"C:\ServerTremol\Bonuri"),
+            out_dir=cfg.get("TREMOL_OUT_DIR", r"C:\ServerTremol"),
+            timeout_s=cfg.get("TIMEOUT_SECONDS", 45),
+        )
+        return d._download_anaf_via_tremol(from_date, to_date)
+    else:
+        d = DatecsDriver(
+            in_dir=cfg.get("DATECS_IN_DIR", r"C:\Datecs\In"),
+            out_dir=cfg.get("DATECS_OUT_DIR", r"C:\Datecs\Out"),
+            format_mode=cfg.get("DATECS_FORMAT", "dude"),
+            timeout_s=cfg.get("TIMEOUT_SECONDS", 45),
+        )
+        return d._download_anaf_via_dude(from_date, to_date)
 
 
 # ==================== CLOUD API & WEBSOCKET ENGINE ====================
@@ -2305,7 +2366,7 @@ ADMIN_HTML = r"""<!DOCTYPE html>
       </div>
 
       <div style="background:rgba(255,255,255,0.03);padding:14px;border-radius:6px;margin-top:12px;border:1px solid var(--border);">
-        <strong style="display:block;margin-bottom:8px;font-size:0.95rem;">📥 Extragere Manuală Pachete ANAF (Datecs DUDE COM)</strong>
+        <strong style="display:block;margin-bottom:8px;font-size:0.95rem;">📥 Extragere Manuală Pachete ANAF (Datecs / ServerTremol)</strong>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
           <div>
             <label for="anafFromDate" style="font-size:0.8rem;display:block;margin-bottom:4px;">De la data</label>
@@ -2536,7 +2597,7 @@ async function downloadAnafNow() {
   const to_date = (document.getElementById('anafToDate').value || '').trim();
   const box = document.getElementById('actionMsg');
   box.style.display = 'block';
-  box.textContent = `Descărcare pachete ANAF prin Datecs DUDE COM (${from_date} -> ${to_date}) în curs...`;
+  box.textContent = `Descărcare/export pachete ANAF (${from_date} -> ${to_date}) în curs...`;
   try {
     const res = await fetch('/service/download-anaf', {
       method: 'POST',
@@ -2894,7 +2955,7 @@ class AnafXmlWatcher:
             raw = [p for p in re.split(r"[;\n]", raw) if p.strip()]
         result = [os.path.expandvars(os.path.expanduser(str(p).strip())) for p in raw if str(p).strip()]
         # Fallback pe folderele standard dacă există pe disc și nu sunt adăugate deja
-        for fallback in (get_config().get("DATECS_ANAF_DIR", r"C:\Datecs\ANAF"), r"C:\Datecs\ANAF", r"C:\ServerTremol\ANAF"):
+        for fallback in (get_config().get("DATECS_ANAF_DIR", r"C:\Datecs\ANAF"), r"C:\Datecs\ANAF", r"C:\ServerTremol\ANAF", r"C:\ServerTremol\RapoarteTXT", r"C:\ServerTremol\Bonuri\done"):
             if os.path.isdir(fallback) and fallback not in result:
                 result.append(fallback)
         return result
