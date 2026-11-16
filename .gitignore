@@ -28,3 +28,5 @@ github_release.py
 venv/
 .venv/
 env/
+file_usn_journal.json
+offline_fiscal_journal.json

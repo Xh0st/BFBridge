@@ -1,82 +1,74 @@
-# Sincrona Universal Fiscal Bridge (BFBridge)
-> Enterprise IoT Edge Agent pentru conectarea caselor de marcat fiscale Windows la platforma SaaS Sincrona Auto.
+# Punte locală ErpNet.FP (Sincrona)
 
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20%7C%20Server-lightgrey.svg)]()
-[![Architecture](https://img.shields.io/badge/Architecture-C%2B%2B%20Native%20(Nuitka)-orange.svg)]()
-[![Service](https://img.shields.io/badge/Service-NSSM%20Background%20Service-green.svg)]()
+Rulează pe stația fiscală, lângă ErpNet.FP (sau simulatorul compatibil).
 
----
+1. Pornește ErpNet.FP **sau** simulatorul: `python simulator.py` — ascultă pe `http://127.0.0.1:8001`
+   (același API ca ErpNet.FP: `POST /printers/{id}/receipt`, `GET /printers/taskinfo?id=`).
+2. În Sincrona → Setări → Casă de marcat (pentru filiala selectată): server local `http://127.0.0.1:8001`,
+   ID imprimantă, mod (test/live), maparea cote TVA → grupe fiscale. Generează tokenul de dispozitiv.
+3. Configurează puntea în `config.json` (lângă script) **sau** din panoul `http://127.0.0.1:8002`:
 
-## 📌 Prezentare Generală
-
-**BFBridge** este un agent middleware de nivel enterprise care rulează pe stațiile Windows din service-urile auto. Acesta înlocuiește vechile binare împachetate cu PyInstaller printr-un executabil compilat nativ în C++ folosind **Nuitka**, eliminând definitiv alarmele false din Windows Defender și SmartScreen.
-
-Aplicația rulează complet invizibil ca **Windows Background Service** gestionat prin **NSSM**, asigurând repornire automată la boot și recuperare în caz de eroare.
-
----
-
-## 🚀 Piloni Arhitecturali
-
-### 1. Router Fiscal Universal
-Bridge-ul expune o interfață locală de configurare la `http://localhost:8002/` și menține o conexiune deschisă bidirecțională prin **WebSockets** cu `https://sincrona.ro` (cu heartbeat ping/pong și fallback pe HTTP Polling).
-
-Pachetele JSON universale primite din cloud sunt rutate nativ către:
-- **ErpNet.FP**: HTTP REST pe `localhost:8001` (bonuri, rapoarte X/Z, gestiune idempotență `E109`).
-- **Datecs DUDE & FPrinter**: Generează fișiere `.inp` în folderul `IN` cu encodare Windows-1250 (`cp1250`) și detectează asincron răspunsul prin `watchdog` pe folderul `OUT`.
-- **Tremol ZFPServer**: Generează fișiere `bon.<id>.txt` în folderul `Bonuri` (`cp1250`) și citește rezultatul din `raspuns.txt`.
-
-### 2. Compilare Nativă Nuitka (Zero False Positives)
-Codul Python este transpus în cod C++ și compilat nativ (`--standalone`, `--windows-console-mode=disable`). Deoarece fișierele nu mai sunt dezarhivate silențios în directorul `%TEMP%` ca la PyInstaller, antivirusul nu le mai blochează.
-
-### 3. Serviciu Windows Invizibil (NSSM)
-Bridge-ul este înregistrat în Windows Service Control Manager folosind **NSSM (Non-Sucking Service Manager)**:
-- Autostart la pornirea sistemului (`SERVICE_AUTO_START`).
-- Auto-restart pe crash (delay configurat la 5s).
-- Rotație automată a fișierelor de log stdout/stderr la fiecare 5MB.
-
-### 4. Installer Automat Inno Setup
-Scriptul `SincronaSetup.iss` generează un pachet de instalare enterprise:
-- Solicită drepturi de Administrator (UAC).
-- Execută în mod silențios un script PowerShell care adaugă directorul `C:\SincronaBridge` la **Excepțiile Windows Defender** înainte de extragerea binarelor.
-- Configurează și pornește serviciul Windows în fundal.
-
----
-
-## 🛠️ Ghid de Compilare și Build
-
-### Cerințe preliminare
-- Python 3.10+ (x64)
-- Dependințe: `pip install -r requirements.txt`
-
-### 1. Compilare Binar Nuitka
-Rulați din terminal:
-```cmd
-build.bat
-```
-sau cu Python:
-```bash
-python build.py
-```
-Rezultatul va fi generat în `dist\erpnet_fp_bridge.dist\`.
-
-### 2. Generare Installer Inno Setup
-Deschideți `SincronaSetup.iss` în Inno Setup Compiler și compilați, sau rulați din consolă:
-```cmd
-iscc SincronaSetup.iss
-```
-Pachetul final `SincronaSetup.exe` va fi generat în `installer_output\`.
-
----
-
-## 🔒 Semnare Digitală (Code Signing OV / EV)
-
-Pentru o reputație impecabilă în Windows SmartScreen:
-```cmd
-signtool.exe sign /v /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a "installer_output\SincronaSetup.exe"
+```json
+{ "API_URL": "https://api.sincrona.ro", "DEVICE_TOKEN": "fp_..." }
 ```
 
----
+   Alternativ, variabile de mediu: `SINCRONA_API_URL`, `FP_DEVICE_TOKEN`.
+4. Pornește: `python erpnet_fp_bridge.py`.
 
-## 📄 Licență & Suport
-Proprietar: **Sincrona Auto** (https://sincrona.ro)
+Puntea preia doar joburile filialei/imprimantei asociate tokenului. La refuz, codul și mesajul casei
+(ex. `PAPER_OUT`) sunt trimise înapoi în Sincrona și apar la bonul în așteptare.
+
+**Securitate:** tokenul nu este scris în cod. Nu urca `config.json` și fișierele `*.jsonl` / `*.log`
+pe GitHub (sunt în `.gitignore`). Dacă un token a ajuns în cod sau în git, revocă-l din Sincrona și generează altul.
+
+## Rapoarte casă de marcat
+
+Din Sincrona → Casă → „Rapoarte casă de marcat”: **Raport X** (informativ), **Raport Z** (închidere zilnică,
+obligatoriu) și **Raport lunar memorie fiscală** (`periodreport`, scurt). Puntea apelează
+`POST /printers/{id}/xreport | zreport | periodreport` din ErpNet.FP; simulatorul le suportă și el.
+Tipul plății pe bon: numerar → `cash`, POS/card → `card`, transfer → `bank` (câmpul `payments[].paymentType`).
+
+## Idempotență (bon tipărit o singură dată)
+
+- Fiecare bon are `taskId` = `uniqueSaleNumber` = `pa-<id încasare>`.
+- Dacă ErpNet.FP întoarce `E109` (taskId deja folosit) la o reîncercare, puntea nu retrimite bonul, ci citește
+  rezultatul taskului inițial.
+- Driverul românesc (fork ErpNet.FP v1.1.0-ro) ține jurnalul `usn-journal`: un bon retrimis cu același
+  `uniqueSaleNumber` nu se mai tipărește (întoarce rezultatul salvat). `E409` = bon întrerupt, posibil tipărit —
+  verificați ultimul bon pe casă.
+- Puntea așteaptă confirmarea casei 80 s (170 s la raportul de memorie fiscală); la depășire raportează
+  `TASK_TIMEOUT`, iar „Reîncearcă” din Sincrona este sigur.
+
+## Fișiere XML ANAF ale rapoartelor Z (preluare automată)
+
+Casa de marcat generează, la fiecare raport Z, fișierul XML cerut de OPANAF 146/2018 (semnat de aparat).
+Puntea nu îl citește direct din aparat: îl preia din folderul în care îl salvează programul producătorului.
+
+1. Exportați fișierele ANAF din programul producătorului într-un folder fix, de exemplu:
+   - Datecs: DUDE (*Datecs Applications\DUDE*), funcția de citire / export a fișierelor ANAF (XML) din casa de marcat → `C:\Datecs\ANAF`;
+   - Tremol: utilitarul Tremol pentru fișierele ANAF / jurnalul electronic → de ex. `C:\ServerTremol\ANAF`.
+2. În panoul punții (http://127.0.0.1:8002) → „Fișiere XML ANAF” → „Foldere urmărite”, treceți folderul (câte unul pe rând) și salvați.
+   (În `config.json`: `"ANAF_XML_DIRS": ["C:\\Datecs\\ANAF"]`.)
+3. La fiecare minut puntea trimite fișierele noi (`.xml`, `.p7m`, `.p7s`, `.zip`); Sincrona le potrivește după NUI, numărul Z
+   și dată și le atașează la Raportul Z al filialei. Dacă Raportul Z nu e încă în Sincrona, puntea reîncearcă la 10 minute.
+   Evidența fișierelor trimise: `anaf_xml_sent.json`.
+
+Simulator: la fiecare raport Z scrie un XML de TEST (nesemnat) în `anaf_xml\` lângă simulator
+(`"simulator": {"anaf_xml_dir": "..."}` în config.json; gol = dezactivat). Treceți acel folder la „Foldere urmărite”.
+
+Manual: Facturi › Contabilitate › Rapoarte Z › „Import fișiere ANAF (XML / ZIP)” — se pot selecta mai multe fișiere sau o arhivă.
+
+## Fără internet (mod offline)
+
+Cât e internet, puntea descarcă din Sincrona setările casei (imprimanta, mod test/live, cotele TVA → grupe fiscale)
+în `offline_profile.json`. Fără internet, aplicația Sincrona deschisă **pe acest calculator** (pagina „Sincronizare”)
+trimite bonul fiscal sau raportul X / Z direct la punte (`http://127.0.0.1:8002/local/*`), care îl tipărește pe casă,
+îl notează în `offline_records.json` și îl trimite singură în Sincrona când revine internetul
+(`POST /api/device/fiscal-printer/offline-records`). Același bon cerut de două ori nu se tipărește a doua oară.
+
+- Doar paginile `https://*.sincrona.ro` (și `localhost` pentru dezvoltare) pot trimite bonuri la punte; setările punții
+  (`/service/*`) se schimbă doar din panoul ei. Panoul ascultă doar pe `127.0.0.1` (`"ADMIN_BIND": "0.0.0.0"` în
+  `config.json` pentru acces din rețea).
+- Bonurile emise offline apar în Sincrona pe pagina „Sincronizare” și trebuie trecute la încasări cu numărul bonului;
+  raportul Z offline se înregistrează automat la Rapoartele Z.
+- `offline_profile.json` și `offline_records.json` nu se urcă pe GitHub.

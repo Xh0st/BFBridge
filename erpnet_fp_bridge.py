@@ -12,6 +12,8 @@ Conexiune Cloud: WebSocket rezilient (wss://) cu fallback pe HTTP Polling.
 """
 
 import asyncio
+import base64
+import hashlib
 import glob
 import http.server
 import json
@@ -135,6 +137,11 @@ DEFAULT_CONFIG = {
     "TREMOL_OUT_DIR": r"C:\ServerTremol",
     "POLL_FALLBACK": True,
     "TIMEOUT_SECONDS": 45,
+    # Fișierele XML ANAF ale rapoartelor Z (OPANAF 146/2018): folderele în care DUDE / utilitarul Tremol /
+    # simulatorul le salvează. Puntea le trimite automat în Sincrona și le atașează la Raportul Z.
+    "ANAF_XML_DIRS": [],
+    "ANAF_XML_SCAN_SECONDS": 60,
+    "ANAF_XML_MAX_AGE_DAYS": 45,
 }
 
 _cfg_lock = threading.Lock()
@@ -665,10 +672,63 @@ class DatecsDriver(BaseFiscalDriver):
         lines.append("T,1,______,_,__;")
         return lines
 
-    def print_receipt(self, job_payload: dict, task_id: str) -> dict:
+    def recover_receipt(self, file_base: str):
+        """Încercare anterioară cu rezultat necunoscut (timeout / punte repornită).
+        Întoarce: ("done", rezultat) | ("not_sent", None) — fișierul nu a fost preluat, îl retragem |
+        ("failed", text) — casa a respins | ("unknown", None) — preluat, fără răspuns."""
+        base_name = f"bon_{file_base}"
+        inp_file = os.path.join(self.in_dir, f"{base_name}.inp")
+        if os.path.exists(inp_file):
+            try:
+                # dacă DUDE / FPrinter îl are deschis, redenumirea eșuează pe Windows -> încă în lucru
+                os.replace(inp_file, inp_file + ".anulat")
+                return "not_sent", None
+            except OSError:
+                return "unknown", None
+        for ext in ("out", "err", "ans", "txt"):
+            path = os.path.join(self.out_dir, f"{base_name}.{ext}")
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                try:
+                    with open(path, "r", encoding="cp1250", errors="replace") as f:
+                        res_text = f.read().strip()
+                    os.remove(path)
+                except OSError:
+                    return "unknown", None
+                try:
+                    return "done", self._result_from_response(res_text, base_name, file_base)
+                except FiscalException as exc:
+                    return "failed", exc.text
+        return "unknown", None
+
+    def _result_from_response(self, res_text: str, base_name: str, task_id: str) -> dict:
+        upper_res = res_text.upper()
+        if "ERR" in upper_res or "ERROR" in upper_res or res_text.startswith("-1"):
+            raise FiscalException("DATECS_REJECTED", f"Datecs a raportat eroare: {res_text}")
+        receipt_num = ""
+        parts = res_text.split(";")
+        if len(parts) >= 4:
+            if parts[3].strip().isdigit():
+                receipt_num = parts[3].strip()
+            else:
+                for p in parts:
+                    clean_p = p.strip()
+                    if clean_p.isdigit() and len(clean_p) >= 1:
+                        receipt_num = clean_p
+                        break
+        return {
+            "ok": True,
+            "result": res_text,
+            "file": base_name,
+            "receiptNumber": receipt_num,
+            "receipt_number": receipt_num,
+            "taskId": task_id,
+        }
+
+    def print_receipt(self, job_payload: dict, task_id: str, file_base: str = "") -> dict:
         self._ensure_server_running()
         receipt = job_payload.get("receipt") or job_payload.get("body") or {}
-        base_name = f"bon_{int(time.time())}_{task_id[-8:]}"
+        # nume determinist pe încercare (jurnalul USN din FiscalRouter): o reîncercare nu scrie un al doilea bon
+        base_name = f"bon_{file_base}" if file_base else f"bon_{int(time.time())}_{task_id[-8:]}"
 
         if self.format_mode == "fprinter":
             cmd_lines = self._build_fprinter_lines(receipt, job_payload)
@@ -693,27 +753,7 @@ class DatecsDriver(BaseFiscalDriver):
         # Așteaptă confirmarea în folderul OUT
         res_text = self._wait_for_response(base_name)
         logger.info(f"[Datecs] Răspuns primit pentru {base_name}: {res_text[:100]}")
-
-        # Parsare erori: dacă conține ERR, ERROR sau începe cu -1
-        upper_res = res_text.upper()
-        if "ERR" in upper_res or "ERROR" in upper_res or res_text.startswith("-1"):
-            raise FiscalException("DATECS_REJECTED", f"Datecs a raportat eroare: {res_text}")
-
-        # Parsare număr bon (Extragere)
-        # De regulă Datecs răspunde: 0;0;0;[NumarBon];... sau ceva similar
-        receipt_num = ""
-        parts = res_text.split(";")
-        if len(parts) >= 4:
-            # Încercăm să luăm indexul 3 (al 4-lea element) dacă e număr
-            if parts[3].strip().isdigit():
-                receipt_num = parts[3].strip()
-            # Fallback: căutăm prima secvență lungă de cifre
-            else:
-                for p in parts:
-                    clean_p = p.strip()
-                    if clean_p.isdigit() and len(clean_p) >= 1:
-                        receipt_num = clean_p
-                        break
+        result = self._result_from_response(res_text, base_name, task_id)
 
         # Curățare fișier procesat .inp din folderul IN
         try:
@@ -721,59 +761,7 @@ class DatecsDriver(BaseFiscalDriver):
                 os.remove(inp_file)
         except OSError:
             pass
-
-        return {
-            "ok": True,
-            "result": res_text,
-            "file": base_name,
-            "receiptNumber": receipt_num,
-            "receipt_number": receipt_num,
-            "taskId": task_id,
-        }
-
-    def _download_anaf_via_dude(self, from_date: str, to_date: str) -> dict:
-        r"""
-        Descarcă automat fișierele lunare ANAF direct prin serverul COM DUDE
-        fără a fi nevoie de deschiderea aplicației DudeFrontApplication.exe.
-        Salvează fișierele în C:\Datecs\ANAF.
-        """
-        try:
-            import win32com.client
-            cfg = get_config()
-            com_port = int(cfg.get("DATECS_COM_PORT", 6))
-            baud_rate = int(cfg.get("DATECS_BAUDRATE", 115200))
-            anaf_dir = cfg.get("DATECS_ANAF_DIR", r"C:\Datecs\ANAF")
-            os.makedirs(anaf_dir, exist_ok=True)
-
-            logger.info(f"[ANAF] Inițializare server COM DUDE pentru descărcare automată ({from_date} -> {to_date})...")
-            dude_obj = win32com.client.Dispatch("dude.CFD_DUDE")
-            
-            # Format date: DD-MM-YY HH:mm:ss
-            f_p = from_date.split("-")
-            t_p = to_date.split("-")
-            start_dt = f"{f_p[2]}-{f_p[1]}-{f_p[0][2:]} 00:00:00"
-            end_dt = f"{t_p[2]}-{t_p[1]}-{t_p[0][2:]} 23:59:59"
-
-            dude_obj.set_TransportType(0) # 0 = RS232
-            dude_obj.set_RS232(com_port, baud_rate)
-            err = dude_obj.open_Connection()
-            if err != 0:
-                logger.warning(f"[ANAF] Nu s-a putut deschide portul COM{com_port} prin DUDE COM ({err}): {getattr(dude_obj, 'lastError_Message', '')}")
-                return {"ok": False, "error": f"Eroare port COM{com_port}"}
-
-            try:
-                dude_obj.set_Download_Path(anaf_dir)
-                dude_obj.DateRange_StartValue = start_dt
-                dude_obj.DateRange_EndValue = end_dt
-                logger.info(f"[ANAF] Descărcare automată rapoarte ANAF în: {anaf_dir}...")
-                res_code = dude_obj.download_ANAF_DTRange()
-                logger.info(f"[ANAF] Finalizat descărcare ANAF cu cod: {res_code}")
-                return {"ok": True, "code": res_code, "dir": anaf_dir}
-            finally:
-                dude_obj.close_Connection()
-        except Exception as e:
-            logger.info(f"[ANAF] Info: DUDE COM download fallback pe comanda fișier: {e}")
-            return {"ok": False, "error": str(e)}
+        return result
 
     def print_report(self, report_type: str, job_payload: dict, task_id: str) -> dict:
         self._ensure_server_running()
@@ -1006,7 +994,7 @@ class TremolDriver(BaseFiscalDriver):
             cash = 0.0
             card = 0.0
             for f in os.listdir(directory):
-                if re.search(r'bon\.\d+.*\[done\]\[\d+\]\.txt', f):
+                if re.search(r'bon\.(?![a-z]\.raport).+?\[done\]\[\d+\]\.txt', f):
                     docs += 1
                     filepath = os.path.join(directory, f)
                     try:
@@ -1057,7 +1045,7 @@ class TremolDriver(BaseFiscalDriver):
 
         for r, _, fs in os.walk(done_dir):
             for f in fs:
-                if re.search(r'bon\.\d+.*\[done\]\[\d+\]\.txt', f):
+                if re.search(r'bon\.(?![a-z]\.raport).+?\[done\]\[\d+\]\.txt', f):
                     m = re.search(r'\[(\d{8})\d*\]', f)
                     if m:
                         file_dt = m.group(1)
@@ -1189,7 +1177,32 @@ class TremolDriver(BaseFiscalDriver):
 
         raise FiscalException("TREMOL_TIMEOUT", f"Fișierul {job_name}.txt a fost creat în {self.in_dir}, dar Tremol nu a procesat bonul în {self.timeout_s}s. Verificați că ServerTremol.exe rulează și casa este conectată în REG.OPER.")
 
-    def print_receipt(self, job_payload: dict, task_id: str) -> dict:
+    def recover_receipt(self, file_base: str):
+        """Încercare anterioară cu rezultat necunoscut. Vezi DatecsDriver.recover_receipt."""
+        job_name = f"bon.{file_base}"
+        in_file = os.path.join(self.in_dir, f"{job_name}.txt")
+        if os.path.exists(in_file):
+            try:
+                os.replace(in_file, in_file + ".anulat")
+                return "not_sent", None
+            except OSError:
+                return "unknown", None
+        for sub, state in (("done", "done"), ("error", "failed"), ("bad", "failed")):
+            d = os.path.join(self.in_dir, sub)
+            if not os.path.exists(d):
+                continue
+            for r, _, fs in os.walk(d):
+                for f in fs:
+                    if job_name in f:
+                        if state == "failed":
+                            return "failed", f"Tremol a respins fișierul ({f})"
+                        m = re.search(r'\[done\]\[(\d+)\]', f)
+                        num = str(int(m.group(1))) if m and m.group(1).isdigit() else ""
+                        return "done", {"ok": True, "result": f"0|OK|{num}|TREMOL", "receiptNumber": num,
+                                        "receipt_number": num, "taskId": file_base}
+        return "unknown", None
+
+    def print_receipt(self, job_payload: dict, task_id: str, file_base: str = "") -> dict:
         """
         Construiește bon fiscal conform specificației oficiale ServerTremol:
         Linia 1: C|<cui>|<denumire>|<adresa> (obligatoriu prima linie dacă există CUI)
@@ -1199,7 +1212,8 @@ class TremolDriver(BaseFiscalDriver):
         """
         self._ensure_server_running()
         receipt = job_payload.get("receipt") or job_payload.get("body") or {}
-        job_name = f"bon.{int(time.time())}_{task_id[-6:]}"
+        # nume determinist pe încercare (jurnalul USN din FiscalRouter): o reîncercare nu scrie un al doilea bon
+        job_name = f"bon.{file_base}" if file_base else f"bon.{int(time.time())}_{task_id[-6:]}"
         lines = []
 
         # CUI client dacă există conform sintaxă Tremol:
@@ -1456,6 +1470,75 @@ class TremolDriver(BaseFiscalDriver):
         }
 
 
+# ==================== JURNAL USN PENTRU DRIVERELE PE FIȘIERE ====================
+# ErpNet.FP are propriul jurnal uniqueSaleNumber. Datecs (DUDE / FPrinter) și Tremol (ServerTremol) lucrează
+# prin fișiere și nu au echivalent: fără jurnal, o reîncercare după timeout scria un fișier nou și casa putea
+# tipări al doilea bon. Jurnalul ține, pe uniqueSaleNumber (pa-<id plată>), starea: sent (fișier scris, rezultat
+# necunoscut), done (tipărit, cu rezultatul salvat) sau failed (respins sigur, se poate retipări).
+
+class FileUsnJournal:
+    def __init__(self, path: str):
+        self.path = path
+        self.lock = threading.Lock()
+
+    def _load(self) -> dict:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def get(self, usn: str) -> dict:
+        with self.lock:
+            return dict(self._load().get(usn) or {})
+
+    def set(self, usn: str, **rec) -> None:
+        with self.lock:
+            data = self._load()
+            data[usn] = {**(data.get(usn) or {}), **rec, "at": time.time()}
+            cutoff = time.time() - 60 * 24 * 3600  # păstrăm 60 de zile
+            data = {k: v for k, v in data.items() if v.get("at", 0) >= cutoff}
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)
+
+
+FILE_USN_JOURNAL = FileUsnJournal(os.path.join(BASE_DIR, "file_usn_journal.json"))
+FILE_DRIVER_TIMEOUTS = {"DATECS_TIMEOUT"}  # TREMOL_TIMEOUT retrage fișierul neprelucrat -> sigur netipărit
+
+
+def _print_with_usn_journal(driver, payload: dict, task_id: str, usn: str) -> dict:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", usn)[:48] or re.sub(r"[^A-Za-z0-9_-]", "", task_id)[:48]
+    rec = FILE_USN_JOURNAL.get(usn)
+    if rec.get("state") == "done":
+        logger.info(f"[USN] Bonul {usn} a fost deja tipărit ({rec.get('file')}); nu se retipărește.")
+        return rec.get("result") or {}
+    if rec.get("state") == "sent":
+        state, info = driver.recover_receipt(rec["file"])
+        if state == "done":
+            FILE_USN_JOURNAL.set(usn, state="done", result=info)
+            return info
+        if state == "unknown":
+            raise FiscalException(
+                "UNCERTAIN_RECEIPT",
+                "Bonul a fost trimis anterior către casă și nu s-a primit confirmare. Verificați ultimul bon "
+                "tipărit pe casă: dacă s-a tipărit, închideți încasarea cu numărul lui; dacă NU s-a tipărit, "
+                "anulați încasarea în Sincrona și încasați din nou. Bonul nu se retrimite automat ca să nu se dubleze.")
+        logger.info(f"[USN] Încercarea anterioară {rec['file']} pentru {usn}: {state}; se retrimite.")
+    attempt = int(rec.get("attempt") or 0) + 1
+    file_base = f"{safe}_{attempt}"
+    FILE_USN_JOURNAL.set(usn, state="sent", file=file_base, attempt=attempt)
+    try:
+        res = driver.print_receipt(payload, task_id, file_base=file_base)
+    except FiscalException as exc:
+        if exc.code not in FILE_DRIVER_TIMEOUTS:
+            FILE_USN_JOURNAL.set(usn, state="failed", error=f"{exc.code}: {exc.text}")
+        raise
+    FILE_USN_JOURNAL.set(usn, state="done", result=res)
+    return res
+
+
 # ==================== UNIVERSAL FISCAL ROUTER ====================
 
 class FiscalRouter:
@@ -1482,8 +1565,16 @@ class FiscalRouter:
                 erpnet_url=cfg.get("ERPNET_URL", "http://127.0.0.1:8001")
             )
 
+    _print_lock = threading.Lock()
+
     @classmethod
     def execute_job(cls, job: dict) -> dict:
+        # o singură comandă odată către casă: joburile din cloud și bonurile offline (de pe calculator) nu se suprapun
+        with cls._print_lock:
+            return cls._execute_job(job)
+
+    @classmethod
+    def _execute_job(cls, job: dict) -> dict:
         driver = cls.get_driver()
         task_id = job.get("idempotency_key") or job.get("id") or str(int(time.time()))
         # „Reîncearcă” păstrează id-ul jobului: ErpNet.FP ține taskId-urile în memorie și ar răspunde E109 cu
@@ -1500,8 +1591,11 @@ class FiscalRouter:
         if norm_kind in ("xreport", "zreport", "periodreport") or "report" in norm_kind or payload.get("endpoint") in ("xreport", "zreport", "periodreport"):
             rep_type = payload.get("endpoint") or norm_kind
             return driver.print_report(rep_type, payload, task_id)
-        else:
-            return driver.print_receipt(payload, task_id)
+        if isinstance(driver, (DatecsDriver, TremolDriver)):
+            receipt = payload.get("receipt") or payload.get("body") or {}
+            usn = str(receipt.get("uniqueSaleNumber") or job.get("idempotency_key") or job.get("id") or task_id)
+            return _print_with_usn_journal(driver, payload, task_id, usn)
+        return driver.print_receipt(payload, task_id)
 
 
 # ==================== CLOUD API & WEBSOCKET ENGINE ====================
@@ -1774,6 +1868,207 @@ def run_http_polling():
         time.sleep(3)
 
 
+# ==================== MOD OFFLINE (FĂRĂ INTERNET) ====================
+# Când nu e internet, aplicația Sincrona din browser (pe ACEST calculator) trimite bonul direct aici:
+#   GET  /local/status   — puntea răspunde? are setările casei? câte bonuri offline așteaptă trimiterea
+#   POST /local/receipt  — {client_ref, label, lines:[{name, qty, unit_price (cu TVA), vat_rate}],
+#                           payments:[{amount, method: numerar|card}], buyer_tax_id?, buyer_name?}
+#   POST /local/report   — {client_ref, type: "x" | "z"}
+# Setările casei (adresa ErpNet.FP, imprimanta, mod test/live, cotele TVA → grupe fiscale) se iau din Sincrona cât
+# e internet (OFFLINE_PROFILE_FILE). Fiecare bon / raport offline se notează în OFFLINE_RECORDS_FILE și se trimite
+# în Sincrona când revine internetul (POST /api/device/fiscal-printer/offline-records), o singură dată.
+# Același client_ref trimis de două ori nu tipărește al doilea bon (se întoarce rezultatul primului).
+
+OFFLINE_PROFILE_FILE = os.path.join(BASE_DIR, "offline_profile.json")
+OFFLINE_RECORDS_FILE = os.path.join(BASE_DIR, "offline_records.json")
+OFFLINE_PROFILE_EVERY_S = 600
+OFFLINE_UPLOAD_EVERY_S = 30
+OFFLINE_KEEP_DAYS = 90
+# paginile Sincrona care pot trimite bonuri la punte (antetul Origin al browserului nu poate fi falsificat de alt site)
+LOCAL_ORIGIN_RE = re.compile(r"^(https://([a-z0-9-]+\.)?sincrona\.ro|https?://(localhost|127\.0\.0\.1)(:\d+)?)$")
+CLIENT_REF_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_offline_lock = threading.Lock()
+
+
+def _read_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def offline_profile() -> dict:
+    return _read_json(OFFLINE_PROFILE_FILE, {})
+
+
+def refresh_offline_profile() -> bool:
+    """Setările casei din Sincrona, păstrate pentru bonurile emise fără internet."""
+    api_url = get_config().get("API_URL", "").rstrip("/")
+    if not api_url or not get_config().get("DEVICE_TOKEN"):
+        return False
+    try:
+        r = requests.get(f"{api_url}/api/device/fiscal-printer/status", headers=get_headers(), timeout=10)
+        if r.status_code != 200:
+            return False
+        prof = (r.json() or {}).get("offline_profile")
+        if prof:
+            _write_json(OFFLINE_PROFILE_FILE, {**prof, "saved_at": datetime.now().isoformat(timespec="seconds")})
+            return True
+    except Exception:  # noqa: BLE001 — fără internet: rămâne profilul salvat anterior
+        pass
+    return False
+
+
+def offline_records() -> dict:
+    return _read_json(OFFLINE_RECORDS_FILE, {})
+
+
+def _save_record(ref: str, **rec) -> dict:
+    with _offline_lock:
+        data = offline_records()
+        data[ref] = {**(data.get(ref) or {}), **rec}
+        cutoff = time.time() - OFFLINE_KEEP_DAYS * 86400
+        data = {k: v for k, v in data.items() if not v.get("uploaded") or v.get("ts", 0) >= cutoff}
+        _write_json(OFFLINE_RECORDS_FILE, data)
+        return dict(data[ref])
+
+
+def _money(v) -> float:
+    return round(float(v or 0) + 0.0, 2)
+
+
+def build_offline_receipt(body: dict, prof: dict) -> dict:
+    """Bonul în formatul joburilor din Sincrona (aceleași drivere: ErpNet.FP / Datecs / Tremol)."""
+    vat_map = {str(k): int(v) for k, v in (prof.get("vat_to_tax_group") or {"21": 1, "11": 2, "0": 3}).items()}
+    items = []
+    total = 0.0
+    for ln in body.get("lines") or []:
+        qty = float(ln.get("qty") or 0)
+        price = _money(ln.get("unit_price"))
+        if qty <= 0 or price <= 0:
+            raise FiscalException("INVALID_LINE", "Fiecare rând are nevoie de cantitate și preț mai mari decât zero.")
+        rate = str(int(round(float(ln.get("vat_rate", 21) or 0))))
+        if rate not in vat_map:
+            raise FiscalException("VAT_MAPPING", f"Cota TVA {rate}% nu are grupă fiscală în setările casei de marcat.")
+        text = sanitize_comment_text(str(ln.get("name") or "Produs"), 36) or "Produs"
+        items.append({"text": text, "quantity": qty, "unit": str(ln.get("unit") or "buc")[:6], "unitPrice": price,
+                      "taxGroup": vat_map[rate]})
+        total += qty * price
+    if not items:
+        raise FiscalException("EMPTY_RECEIPT", "Bonul nu are niciun produs.")
+    total = round(total, 2)
+    payments = []
+    for p in body.get("payments") or [{"amount": total, "method": "numerar"}]:
+        method = str(p.get("method") or "numerar").lower()
+        payments.append({"amount": _money(p.get("amount")), "paymentType": "card" if method in ("card", "pos") else "cash"})
+    if abs(sum(p["amount"] for p in payments) - total) > 0.009:
+        raise FiscalException("PAYMENT_TOTAL", f"Plata ({sum(p['amount'] for p in payments):.2f}) trebuie să fie egală cu totalul bonului ({total:.2f}).")
+    ref = body["client_ref"]
+    receipt = {"uniqueSaleNumber": f"of-{ref}"[:64], "items": items, "payments": payments}
+    payload = {
+        "erpnet_url": prof.get("erpnet_url") or get_config().get("ERPNET_URL", "http://127.0.0.1:8001"),
+        "printer_id": prof.get("printer_id") or "default",
+        "mode": prof.get("mode") or "test",
+        "test_transport": prof.get("test_transport") or "local",
+        "receipt": receipt,
+        "endpoint": "receipt",
+    }
+    tax = re.sub(r"[^0-9A-Za-z]", "", str(body.get("buyer_tax_id") or "")).upper()
+    if tax and not (len(tax) == 13 and tax.isdigit()):  # doar firme (CUI), nu CNP
+        payload["buyer_tax_id"] = tax
+        payload["client_cui"] = tax
+        payload["buyer_name"] = str(body.get("buyer_name") or "Client")[:60]
+        if prof.get("supports_invoice") is not False:
+            payload["endpoint"] = "invoice"
+            payload["body"] = {**receipt, "recipient": {"name": payload["buyer_name"], "identifier": tax.removeprefix("RO"),
+                                                        "uniqueRegistrationNumber": tax.removeprefix("RO"),
+                                                        **({"vatNumber": tax} if tax.startswith("RO") else {})}}
+    return {"payload": payload, "total": total}
+
+
+def run_offline_job(kind: str, ref: str, payload: dict, meta: dict) -> dict:
+    prev = offline_records().get(ref)
+    if prev and prev.get("status") == "completed":
+        return prev  # același bon cerut din nou: nu se retipărește
+    _save_record(ref, client_ref=ref, kind=kind, payload=payload, status="printing", ts=time.time(),
+                 at=datetime.now().astimezone().isoformat(timespec="seconds"), uploaded=False, **meta)
+    job = {"id": f"off-{ref}", "kind": kind, "idempotency_key": f"of-{ref}", "payload": payload}
+    try:
+        res = FiscalRouter.execute_job(job)
+        rec = _save_record(ref, status="completed", result=res or {}, uploaded=False)
+        update_state(total_jobs_ok=get_state()["total_jobs_ok"] + 1, last_job_status="completed (offline)")
+    except Exception as err:  # noqa: BLE001
+        code = getattr(err, "code", "EXECUTION_ERROR")
+        text = getattr(err, "text", str(err))
+        rec = _save_record(ref, status="failed", result={"error": code, "text": text}, uploaded=False)
+        log_error("offline", code, text, {"client_ref": ref})
+    threading.Thread(target=upload_offline_records, daemon=True).start()
+    return rec
+
+
+def upload_offline_records() -> int:
+    """Bonurile și rapoartele emise fără internet ajung în Sincrona (Casă), o singură dată."""
+    api_url = get_config().get("API_URL", "").rstrip("/")
+    if not api_url or not get_config().get("DEVICE_TOKEN"):
+        return 0
+    pending = [r for r in offline_records().values() if not r.get("uploaded") and r.get("status") in ("completed", "failed")]
+    sent = 0
+    for i in range(0, len(pending), 25):
+        batch = pending[i:i + 25]
+        try:
+            r = requests.post(f"{api_url}/api/device/fiscal-printer/offline-records", headers=get_headers(),
+                              json={"records": batch}, timeout=20)
+            if r.status_code != 200:
+                break
+            done = {x.get("client_ref") for x in (r.json() or {}).get("results", []) if x.get("status") in ("saved", "exists")}
+            for ref in done:
+                _save_record(ref, uploaded=True)
+            sent += len(done)
+        except Exception:  # noqa: BLE001 — tot fără internet: se reîncearcă
+            break
+    return sent
+
+
+def run_offline_worker():
+    last_profile = 0.0
+    while True:
+        try:
+            if time.time() - last_profile > OFFLINE_PROFILE_EVERY_S:
+                if refresh_offline_profile():
+                    last_profile = time.time()
+                else:
+                    last_profile = time.time() - OFFLINE_PROFILE_EVERY_S + 60  # fără internet: reîncercare peste 1 minut
+            upload_offline_records()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Offline] {e}")
+        time.sleep(OFFLINE_UPLOAD_EVERY_S)
+
+
+def local_status() -> dict:
+    prof = offline_profile()
+    recs = offline_records()
+    return {
+        "ok": True,
+        "bridge": "sincrona",
+        "driver": get_config().get("FISCAL_DRIVER", "erpnet"),
+        "connected_cloud": get_state().get("connected_cloud"),
+        "profile": {k: prof.get(k) for k in ("tenant_id", "branch_id", "branch_name", "printer_id", "mode", "vat_to_tax_group", "saved_at")} if prof else None,
+        "pending_upload": sum(1 for r in recs.values() if not r.get("uploaded")),
+        "recent": sorted(
+            [{k: r.get(k) for k in ("client_ref", "kind", "label", "total", "status", "at", "uploaded")} |
+             {"receipt_number": (r.get("result") or {}).get("receiptNumber"), "error": (r.get("result") or {}).get("text")}
+             for r in recs.values()], key=lambda x: x.get("at") or "", reverse=True)[:20],
+    }
+
+
 # ==================== LOCAL ADMIN WEB INTERFACE (PORT 8002) ====================
 
 ADMIN_HTML = r"""<!DOCTYPE html>
@@ -1901,6 +2196,13 @@ ADMIN_HTML = r"""<!DOCTYPE html>
         </div>
       </div>
 
+      <h2 style="margin-top:24px;">🧾 Fișiere XML ANAF (rapoarte Z)</h2>
+      <div class="field">
+        <label for="anafDirs">Foldere urmărite (câte unul pe rând)</label>
+        <textarea id="anafDirs" rows="3" style="width:100%;font-family:monospace" placeholder="C:\Datecs\ANAF&#10;C:\ServerTremol\ANAF"></textarea>
+        <small>Folderele în care DUDE, utilitarul Tremol sau simulatorul salvează fișierele XML ale rapoartelor Z. Puntea le trimite automat în Sincrona și le atașează la Raportul Z (Facturi › Contabilitate › Rapoarte Z).</small>
+      </div>
+
       <h2 style="margin-top:24px;">☁️ Conexiune Cloud (Sincrona)</h2>
       <div class="field">
         <label for="apiUrl">API URL</label>
@@ -1992,6 +2294,7 @@ async function loadData() {
     document.getElementById('datecsOut').value = c.DATECS_OUT_DIR || '';
     document.getElementById('tremolIn').value = c.TREMOL_IN_DIR || '';
     document.getElementById('tremolOut').value = c.TREMOL_OUT_DIR || '';
+    document.getElementById('anafDirs').value = (Array.isArray(c.ANAF_XML_DIRS) ? c.ANAF_XML_DIRS : String(c.ANAF_XML_DIRS || '').split(';')).filter(Boolean).join('\n');
     document.getElementById('apiUrl').value = c.API_URL || '';
     document.getElementById('wsUrl').value = c.WS_URL || '';
     toggleDriverFields();
@@ -2058,6 +2361,7 @@ async function saveConfiguration() {
     DATECS_OUT_DIR: document.getElementById('datecsOut').value.trim(),
     TREMOL_IN_DIR: document.getElementById('tremolIn').value.trim(),
     TREMOL_OUT_DIR: document.getElementById('tremolOut').value.trim(),
+    ANAF_XML_DIRS: document.getElementById('anafDirs').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean),
     API_URL: document.getElementById('apiUrl').value.trim(),
     WS_URL: document.getElementById('wsUrl').value.trim()
   };
@@ -2140,13 +2444,86 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Evită spamming-ul consolei de către requesturile de polling
 
+    def _origin(self) -> str:
+        return (self.headers.get("Origin") or "").strip()
+
+    def _same_origin(self) -> bool:
+        # panoul de administrare (http://127.0.0.1:8002) sau un program local fără Origin
+        o = self._origin()
+        return not o or re.match(r"^http://(127\.0\.0\.1|localhost):8002$", o) is not None
+
+    def _cors(self):
+        o = self._origin()
+        if o and LOCAL_ORIGIN_RE.match(o):
+            self.send_header("Access-Control-Allow-Origin", o)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            # Chrome: o pagină de pe internet care vorbește cu un program de pe calculator (Private Network Access)
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Access-Control-Max-Age", "600")
+
     def _send_json(self, code: int, data: dict):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._cors()
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json(self) -> dict:
+        length = min(int(self.headers.get("Content-Length", 0) or 0), 1_000_000)
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8") or "{}")
+
+    def do_OPTIONS(self):
+        if not LOCAL_ORIGIN_RE.match(self._origin()) or not urlparse(self.path).path.startswith("/local/"):
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def _local_post(self, path: str):
+        if not (LOCAL_ORIGIN_RE.match(self._origin()) or self._same_origin()):
+            self._send_json(403, {"ok": False, "error": "Origine nepermisă"})
+            return
+        try:
+            body = self._read_json()
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "JSON invalid"})
+            return
+        ref = str(body.get("client_ref") or "")
+        if not CLIENT_REF_RE.match(ref):
+            self._send_json(400, {"ok": False, "error": "client_ref invalid"})
+            return
+        prof = offline_profile()
+        if not prof:
+            self._send_json(409, {"ok": False, "error": "Puntea nu are încă setările casei de marcat. Porniți-o o dată cu internet (se descarcă singure din Sincrona)."})
+            return
+        try:
+            if path == "/local/receipt":
+                built = build_offline_receipt(body, prof)
+                rec = run_offline_job("fiscal_receipt", ref, built["payload"], {
+                    "label": str(body.get("label") or "Bon fiscal offline")[:120], "total": built["total"],
+                    "lines": body.get("lines") or [], "payments": body.get("payments") or [], "source": body.get("source") or {}})
+            else:
+                rtype = str(body.get("type") or "x").lower()
+                if rtype not in ("x", "z"):
+                    raise FiscalException("REPORT_TYPE", "Raportul poate fi X sau Z.")
+                payload = {"erpnet_url": prof.get("erpnet_url") or get_config().get("ERPNET_URL"), "printer_id": prof.get("printer_id") or "default",
+                           "mode": prof.get("mode") or "test", "test_transport": prof.get("test_transport") or "local",
+                           "endpoint": f"{rtype}report", "body": {}}
+                rec = run_offline_job(f"{rtype}_report", ref, payload, {"label": f"Raport {rtype.upper()} (offline)", "total": 0})
+        except FiscalException as exc:
+            self._send_json(400, {"ok": False, "error": exc.text, "code": exc.code})
+            return
+        ok = rec.get("status") == "completed"
+        res = rec.get("result") or {}
+        self._send_json(200 if ok else 502, {"ok": ok, "status": rec.get("status"), "receipt_number": res.get("receiptNumber"),
+                                             "error": None if ok else res.get("text"), "code": None if ok else res.get("error"), "record": {
+                                                 k: rec.get(k) for k in ("client_ref", "kind", "label", "total", "status", "at")}})
 
     def _send_html(self, html: str):
         body = html.encode("utf-8")
@@ -2158,6 +2535,15 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/local/status":
+            if not (LOCAL_ORIGIN_RE.match(self._origin()) or self._same_origin()):
+                self._send_json(403, {"ok": False})
+                return
+            self._send_json(200, local_status())
+            return
+        if not self._same_origin():
+            self._send_json(403, {"error": "Origine nepermisă"})
+            return
         if path in ("/", "/index.html", "/admin"):
             self._send_html(ADMIN_HTML)
         elif path == "/service/status":
@@ -2178,6 +2564,13 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path in ("/local/receipt", "/local/report"):
+            self._local_post(path)
+            return
+        # setările punții se schimbă doar din panoul ei (un site străin nu poate redirecționa tokenul casei)
+        if not self._same_origin():
+            self._send_json(403, {"ok": False, "error": "Origine nepermisă"})
+            return
 
         if path == "/service/config":
             length = int(self.headers.get("Content-Length", 0))
@@ -2260,7 +2653,9 @@ class AdminHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
 def start_admin_server(port: int = 8002):
     try:
-        server = http.server.ThreadingHTTPServer(("0.0.0.0", port), AdminHTTPRequestHandler)
+        # doar pe acest calculator (panoul și bonurile offline nu se deschid din rețea); ADMIN_BIND=0.0.0.0 pentru acces din LAN
+        bind = get_config().get("ADMIN_BIND") or "127.0.0.1"
+        server = http.server.ThreadingHTTPServer((bind, port), AdminHTTPRequestHandler)
         t = threading.Thread(target=server.serve_forever, daemon=True, name="AdminWeb8002")
         t.start()
         logger.info(f"[Admin] Panou web pornit pe http://127.0.0.1:{port}/")
@@ -2271,6 +2666,127 @@ def start_admin_server(port: int = 8002):
 
 
 # ==================== MAIN ENTRY POINT ====================
+
+# ==================== FIȘIERE XML ANAF (A4200) ====================
+
+class AnafXmlWatcher:
+    """Urmărește folderele ANAF_XML_DIRS și trimite fișierele noi (.xml / .p7m / .p7s / .zip) la Sincrona.
+    Evidența (anaf_xml_sent.json) reține amprenta fiecărui fișier: un fișier atașat nu se mai retrimite;
+    unul pentru care Raportul Z nu există încă în Sincrona se reîncearcă la 10 minute."""
+
+    EXT = (".xml", ".p7m", ".p7s", ".zip")
+    RETRY_S = 600
+    MAX_BYTES = 15 * 1024 * 1024
+
+    def __init__(self):
+        self.path = os.path.join(BASE_DIR, "anaf_xml_sent.json")
+        self.ledger = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.ledger = json.load(f)
+        except Exception:
+            self.ledger = {}
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.ledger, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
+
+    @staticmethod
+    def dirs():
+        raw = get_config().get("ANAF_XML_DIRS") or []
+        if isinstance(raw, str):
+            raw = [p for p in re.split(r"[;\n]", raw) if p.strip()]
+        return [os.path.expandvars(os.path.expanduser(str(p).strip())) for p in raw if str(p).strip()]
+
+    def candidates(self):
+        max_age = float(get_config().get("ANAF_XML_MAX_AGE_DAYS", 45)) * 86400
+        limit = time.time() - max_age
+        for root_dir in self.dirs():
+            if not os.path.isdir(root_dir):
+                continue
+            for dirpath, _dirs, files in os.walk(root_dir):
+                for name in files:
+                    if not name.lower().endswith(self.EXT):
+                        continue
+                    full = os.path.join(dirpath, name)
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        continue
+                    # fișier încă în scriere / prea vechi / prea mare
+                    if st.st_mtime < limit or time.time() - st.st_mtime < 5 or st.st_size == 0 or st.st_size > self.MAX_BYTES:
+                        continue
+                    yield full, name
+
+    def scan_once(self):
+        cfg = get_config()
+        api_url = cfg.get("API_URL", "").rstrip("/")
+        if not api_url or not cfg.get("DEVICE_TOKEN"):
+            return
+        changed = False
+        for full, name in self.candidates():
+            try:
+                with open(full, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            digest = hashlib.sha256(data).hexdigest()
+            rec = self.ledger.get(digest) or {}
+            if rec.get("status") in ("attached", "duplicate", "already_attached", "invalid"):
+                continue
+            if rec and time.time() - float(rec.get("ts", 0)) < self.RETRY_S:
+                continue
+            try:
+                r = requests.post(
+                    f"{api_url}/api/device/fiscal-printer/a4200",
+                    headers=get_headers(),
+                    json={"filename": name, "content_b64": base64.b64encode(data).decode("ascii")},
+                    timeout=30,
+                )
+                r.raise_for_status()
+                results = r.json().get("results") or []
+            except Exception as e:
+                log_error("anaf_xml", "UPLOAD_FAIL", f"Trimiterea {name} a eșuat: {e}")
+                self.ledger[digest] = {"path": full, "status": "error", "ts": time.time()}
+                changed = True
+                continue
+            statuses = {x.get("status") for x in results}
+            status = ("attached" if "attached" in statuses else
+                      "not_found" if "not_found" in statuses else
+                      next(iter(statuses), "invalid"))
+            self.ledger[digest] = {"path": full, "status": status, "ts": time.time(),
+                                   "z": [z.get("z_number") for x in results for z in (x.get("z_reports") or [])]}
+            changed = True
+            if status == "attached":
+                logger.info(f"[ANAF XML] {name} atașat la Raportul Z {self.ledger[digest]['z']}")
+            elif status == "not_found":
+                logger.info(f"[ANAF XML] {name}: Raportul Z nu e încă în Sincrona, reîncerc mai târziu")
+            elif status == "invalid":
+                log_error("anaf_xml", "INVALID", f"{name}: {results[0].get('message') if results else 'fișier invalid'}")
+        if changed:
+            # evidența păstrează doar ultimele 5000 de fișiere
+            if len(self.ledger) > 5000:
+                for k in sorted(self.ledger, key=lambda k: self.ledger[k].get("ts", 0))[:-5000]:
+                    self.ledger.pop(k, None)
+            try:
+                self._save()
+            except Exception as e:
+                logger.error(f"[ANAF XML] Nu pot salva evidența: {e}")
+        update_state(anaf_xml_dirs=self.dirs(), anaf_xml_last_scan=datetime.now().isoformat(timespec="seconds"),
+                     anaf_xml_attached=sum(1 for v in self.ledger.values() if v.get("status") == "attached"),
+                     anaf_xml_waiting=sum(1 for v in self.ledger.values() if v.get("status") in ("not_found", "error")))
+
+    def run(self):
+        while True:
+            try:
+                if self.dirs():
+                    self.scan_once()
+            except Exception as e:
+                log_error("anaf_xml", "SCAN_FAIL", f"Eroare la scanarea fișierelor ANAF: {e}")
+            time.sleep(max(15, int(get_config().get("ANAF_XML_SCAN_SECONDS", 60) or 60)))
+
 
 def main():
     logger.info("==================================================")
@@ -2289,6 +2805,12 @@ def main():
     # 3. Pornire HTTP Polling Worker (redundant / fallback)
     poll_thread = threading.Thread(target=run_http_polling, daemon=True, name="HTTPPollWorker")
     poll_thread.start()
+
+    # 4. Mod offline: setările casei din Sincrona + trimiterea bonurilor emise fără internet
+    threading.Thread(target=run_offline_worker, daemon=True, name="OfflineWorker").start()
+
+    # 4. Preluare automată fișiere XML ANAF (rapoarte Z) din folderele configurate
+    threading.Thread(target=AnafXmlWatcher().run, daemon=True, name="AnafXmlWatcher").start()
 
     # Buclă de supraveghere principală
     try:
